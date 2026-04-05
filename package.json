@@ -1,5 +1,10 @@
 {
+  "name": "mux-direct-upload",
+  "version": "1.0.0",
+  "main": "main.js",
   "dependencies": {
-    "jsonwebtoken": "^9.0.0"
+    "jsonwebtoken": "^9.0.0",
+    "node-appwrite": "^14.1.0",
+    "node-fetch": "^2.7.0"
   }
 }

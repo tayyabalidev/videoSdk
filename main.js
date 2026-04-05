@@ -3,14 +3,12 @@ const fetch = require("node-fetch");
 
 module.exports = async function (req, res) {
   try {
-    // Get data from React Native app
     const { filename, appwriteDocId } = JSON.parse(req.payload);
 
     if (!filename || !appwriteDocId) {
       return res.status(400).send({ error: "filename and appwriteDocId required" });
     }
 
-    // 1️⃣ Create Mux direct upload URL
     const response = await fetch("https://api.mux.com/video/v1/uploads", {
       method: "POST",
       headers: {
@@ -31,10 +29,9 @@ module.exports = async function (req, res) {
     const data = await response.json();
 
     if (!data.data || !data.data.url) {
-      return res.status(500).send({ error: "Failed to create Mux upload URL" });
+      return res.status(500).send({ error: "Failed to create Mux upload URL", muxResponse: data });
     }
 
-    // 2️⃣ Update Appwrite DB document (status: uploading)
     const client = new sdk.Client()
       .setEndpoint(process.env.APPWRITE_ENDPOINT)
       .setProject(process.env.APPWRITE_PROJECT_ID)
@@ -53,10 +50,12 @@ module.exports = async function (req, res) {
       }
     );
 
-    // 3️⃣ Return upload URL to React Native app
-    return res.json({ uploadUrl: data.data.url, uploadId: data.data.id });
+    return res.json({
+      uploadUrl: data.data.url,
+      uploadId: data.data.id,
+    });
   } catch (err) {
-    console.error(err);
+    console.error("MUX DIRECT UPLOAD ERROR:", err);
     return res.status(500).send({ error: err.message });
   }
 };
