@@ -18,21 +18,20 @@ module.exports = async ({ req, res, log }) => {
     }
 
     const body =
-      (req.bodyJson && typeof req.bodyJson === "object" ? req.bodyJson : null) ||
-      (() => {
-        try {
-          return JSON.parse(req.bodyText || "{}");
-        } catch {
-          return {};
-        }
-      })();
+  (req.bodyJson && typeof req.bodyJson === "object" ? req.bodyJson : null) ||
+  JSON.parse(req.bodyText || "{}");
 
-    const filename = body.filename;
-    const appwriteDocId = body.appwriteDocId || body.documentId || body.document_id;
+const appwriteDocId = body.appwriteDocId || body.documentId || body.document_id;
+const filename = body.filename || "video.mp4";
 
-    if (!filename || !appwriteDocId) {
-      return res.json({ error: "filename and appwriteDocId required" }, 400, cors);
-    }
+if (!appwriteDocId) {
+  return res.json({ error: "documentId required" }, 400, cors);
+}
+
+
+
+
+    
 
     const auth = Buffer.from(
       `${process.env.MUX_TOKEN_ID}:${process.env.MUX_TOKEN_SECRET}`
