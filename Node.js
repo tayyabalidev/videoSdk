@@ -11,7 +11,6 @@ function getHeader(headers, key) {
 }
 
 function parseMuxSignature(sigHeader) {
-  // format: t=...,v1=...
   const out = { t: "", v1: "" };
   if (!sigHeader) return out;
   for (const part of String(sigHeader).split(",")) {
@@ -82,7 +81,6 @@ module.exports = async ({ req, res, log }) => {
     const type = event?.type;
     const data = event?.data || {};
 
-    // documentId from passthrough (set in direct-upload function)
     let documentId = null;
     if (typeof data.passthrough === "string" && data.passthrough) {
       try {
@@ -106,6 +104,9 @@ module.exports = async ({ req, res, log }) => {
     if (!endpoint || !projectId || !apiKey || !dbId || !colId) {
       return res.json({ error: "Missing Appwrite env vars" }, 500, cors);
     }
+
+    // Debug to confirm updated key is actually loaded at runtime.
+    log("apiKey prefix: " + String(process.env.APPWRITE_API_KEY || "").slice(0, 6));
 
     const client = new sdk.Client().setEndpoint(endpoint).setProject(projectId).setKey(apiKey);
     const databases = new sdk.Databases(client);
@@ -152,7 +153,9 @@ module.exports = async ({ req, res, log }) => {
 
     return res.json({ ok: true, ignored: type || "unknown" }, 200, cors);
   } catch (err) {
-    try { log(String(err?.stack || err?.message || err)); } catch {}
+    try {
+      log(String(err?.stack || err?.message || err));
+    } catch {}
     return res.json({ error: err?.message || "webhook failed" }, 500, cors);
   }
 };
