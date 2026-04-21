@@ -66,7 +66,7 @@ export default async ({ req, res, log }) => {
 
     const payload = {
       apikey: API_KEY,
-      permissions: ["allow_join", "allow_mod"], // important for host/live controls
+      permissions: ["allow_join", "allow_mod", "ask_join"], // important for host/live controls
       version: 2,
       roles: ["rtc"],
     };
