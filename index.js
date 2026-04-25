@@ -1,15 +1,22 @@
 /**
  * Appwrite Function — VideoSDK JWT for calls + live streaming
  *
- * GET /?meetingId=<room>&participantId=<optional>
- * Response: { token: "..." }
+ * Contract:
+ *   GET /?roomId=<room>&participantId=<optional>
+ *   (backward compatible: also accepts meetingId)
+ *   Response: { "token": "<jwt>" }
  *
  * Required env vars in Appwrite Function:
  * - VIDEOSDK_API_KEY
  * - VIDEOSDK_SECRET_KEY
+ *
+ * Notes:
+ * - Uses CommonJS to match Appwrite Node function runtime defaults.
+ * - Must return every res.* call.
  */
+"use strict";
 
-import jwt from "jsonwebtoken";
+const jwt = require("jsonwebtoken");
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -18,8 +25,11 @@ const CORS_HEADERS = {
 };
 
 function getQueryParam(req, name) {
-  if (req.query && req.query[name] != null && req.query[name] !== "") {
-    return String(req.query[name]);
+  if (req.query && typeof req.query === "object" && !Array.isArray(req.query)) {
+    const v = req.query[name];
+    if (v != null && String(v).trim() !== "") {
+      return String(v).trim();
+    }
   }
 
   const raw =
@@ -30,10 +40,10 @@ function getQueryParam(req, name) {
   if (!raw) return "";
   const params = new URLSearchParams(raw);
   const v = params.get(name);
-  return v != null ? String(v) : "";
+  return v != null ? String(v).trim() : "";
 }
 
-export default async ({ req, res, log }) => {
+module.exports = async ({ req, res, log }) => {
   try {
     const method = String(req.method || "GET").toUpperCase();
 
@@ -61,17 +71,27 @@ export default async ({ req, res, log }) => {
       );
     }
 
-    const meetingId = getQueryParam(req, "meetingId");
+    // Primary param: roomId (current app flow)
+    // Backward compatibility: meetingId (older flow)
+    const roomId = getQueryParam(req, "roomId") || getQueryParam(req, "meetingId");
     const participantId = getQueryParam(req, "participantId");
+
+    if (!roomId) {
+      return res.json(
+        { error: "roomId is required" },
+        400,
+        CORS_HEADERS
+      );
+    }
 
     const payload = {
       apikey: API_KEY,
-      permissions: ["allow_join", "allow_mod", "ask_join"], // important for host/live controls
+      permissions: ["allow_join", "allow_mod", "ask_join"],
       version: 2,
       roles: ["rtc"],
+      roomId,
     };
 
-    if (meetingId) payload.roomId = meetingId;
     if (participantId) payload.participantId = participantId;
 
     const token = jwt.sign(payload, SECRET, {
@@ -84,11 +104,13 @@ export default async ({ req, res, log }) => {
       "Content-Type": "application/json",
     });
   } catch (e) {
-    log(String(e?.message || e));
+    try {
+      log(String((e && e.message) || e));
+    } catch (_) {}
     return res.json(
       {
         error: "Token generation failed",
-        message: e?.message || "unknown",
+        message: (e && e.message) || "unknown",
       },
       500,
       CORS_HEADERS
