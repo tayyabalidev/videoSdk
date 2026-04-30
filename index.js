@@ -12,6 +12,7 @@ function parseQuery(req) {
   if (req.query && typeof req.query === "object" && !Array.isArray(req.query)) {
     const roomId = req.query.roomId ?? req.query["roomId"];
     const participantId = req.query.participantId ?? req.query["participantId"];
+
     if (roomId != null || participantId != null) {
       return {
         roomId: roomId != null ? String(roomId).trim() : "",
@@ -79,10 +80,28 @@ module.exports = async ({ req, res, log }) => {
       }
     );
 
+    const claims = jwt.decode(token) || {};
+    const tokenApiKey = claims?.apikey || null;
+
+    log("Token function apikey:", tokenApiKey);
     log("Token generated for room:", roomId);
-    return res.json({ token }, 200, CORS_HEADERS);
+
+    return res.json(
+      {
+        token,
+        debug: {
+          requestedRoomId: roomId,
+          tokenRoomId: claims?.roomId || null,
+          tokenApiKey,
+          tokenPermissions: claims?.permissions || [],
+        },
+      },
+      200,
+      CORS_HEADERS
+    );
   } catch (e) {
     log("Token error:", e?.message || e);
+
     return res.json(
       { error: "Token generation failed", message: e?.message },
       500,

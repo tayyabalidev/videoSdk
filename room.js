@@ -1,5 +1,7 @@
 "use strict";
 
+const jwt = require("jsonwebtoken");
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -20,6 +22,7 @@ module.exports = async ({ req, res, log }) => {
       return res.json({ error: "Method not allowed" }, 405, CORS_HEADERS);
     }
 
+    // Must be VideoSDK auth JWT for room creation
     const authToken = String(process.env.VIDEOSDK_AUTH_TOKEN || "").trim();
 
     if (!authToken) {
@@ -30,7 +33,10 @@ module.exports = async ({ req, res, log }) => {
       );
     }
 
-    log("Creating VideoSDK room...");
+    // Debug only (safe: no secret exposed)
+    const decodedAuth = jwt.decode(authToken) || {};
+    const authApiKey = decodedAuth?.apikey || null;
+    log("Room function auth apikey:", authApiKey);
 
     const response = await fetch(VIDEOSDK_ROOMS_URL, {
       method: "POST",
@@ -51,6 +57,7 @@ module.exports = async ({ req, res, log }) => {
           error: "Failed to create VideoSDK room",
           status: response.status,
           details: data,
+          debug: { authApiKey },
         },
         response.status,
         CORS_HEADERS
@@ -58,18 +65,28 @@ module.exports = async ({ req, res, log }) => {
     }
 
     const roomId = data?.roomId || data?.room_id || data?.id;
+
     if (!roomId) {
       return res.json(
-        { error: "No roomId returned", details: data },
+        { error: "No roomId returned", details: data, debug: { authApiKey } },
         502,
         CORS_HEADERS
       );
     }
 
     log("Room created:", roomId);
-    return res.json({ roomId }, 200, CORS_HEADERS);
+
+    return res.json(
+      {
+        roomId,
+        debug: { authApiKey },
+      },
+      200,
+      CORS_HEADERS
+    );
   } catch (e) {
-    log("Exception:", e?.message || e);
+    log("Room exception:", e?.message || e);
+
     return res.json(
       { error: "Room creation failed", message: e?.message },
       500,
