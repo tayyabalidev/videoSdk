@@ -10,15 +10,16 @@ const VIDEOSDK_ROOMS_URL = "https://api.videosdk.live/v2/rooms";
 
 module.exports = async ({ req, res, log }) => {
   try {
-    if (req.method === "OPTIONS") {
+    const method = String(req.method || "").toUpperCase();
+
+    if (method === "OPTIONS") {
       return res.send("", 204, CORS_HEADERS);
     }
 
-    if (req.method !== "POST") {
+    if (method !== "POST") {
       return res.json({ error: "Method not allowed" }, 405, CORS_HEADERS);
     }
 
-    // 🔥 MUST USE JWT (not API KEY)
     const authToken = String(process.env.VIDEOSDK_AUTH_TOKEN || "").trim();
 
     if (!authToken) {
@@ -34,7 +35,7 @@ module.exports = async ({ req, res, log }) => {
     const response = await fetch(VIDEOSDK_ROOMS_URL, {
       method: "POST",
       headers: {
-        Authorization: authToken, // ✅ JWT ONLY
+        Authorization: authToken,
         "Content-Type": "application/json",
         Accept: "application/json",
       },
@@ -45,7 +46,6 @@ module.exports = async ({ req, res, log }) => {
 
     if (!response.ok) {
       log("Room creation failed", { status: response.status, data });
-
       return res.json(
         {
           error: "Failed to create VideoSDK room",
@@ -58,7 +58,6 @@ module.exports = async ({ req, res, log }) => {
     }
 
     const roomId = data?.roomId || data?.room_id || data?.id;
-
     if (!roomId) {
       return res.json(
         { error: "No roomId returned", details: data },
@@ -68,11 +67,9 @@ module.exports = async ({ req, res, log }) => {
     }
 
     log("Room created:", roomId);
-
     return res.json({ roomId }, 200, CORS_HEADERS);
   } catch (e) {
     log("Exception:", e?.message || e);
-
     return res.json(
       { error: "Room creation failed", message: e?.message },
       500,
