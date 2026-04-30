@@ -4,7 +4,7 @@ const jwt = require("jsonwebtoken");
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Accept",
 };
 
@@ -14,14 +14,15 @@ module.exports = async ({ req, res, log }) => {
       return res.send("", 204, CORS_HEADERS);
     }
 
-    if (req.method !== "POST") {
+    if (req.method !== "GET") {
       return res.json({ error: "Method not allowed" }, 405, CORS_HEADERS);
     }
 
     const apiKey = process.env.VIDEOSDK_API_KEY;
     const secret = process.env.VIDEOSDK_SECRET_KEY;
 
-    const { roomId, participantId } = JSON.parse(req.body || "{}");
+    const roomId = req.query.roomId;
+    const participantId = req.query.participantId;
 
     if (!roomId || !participantId) {
       return res.json(
