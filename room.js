@@ -22,21 +22,31 @@ module.exports = async ({ req, res, log }) => {
       return res.json({ error: "Method not allowed" }, 405, CORS_HEADERS);
     }
 
-    // Must be VideoSDK auth JWT for room creation
-    const authToken = String(process.env.VIDEOSDK_AUTH_TOKEN || "").trim();
+    const apiKey = process.env.VIDEOSDK_API_KEY;
+    const secret = process.env.VIDEOSDK_SECRET_KEY;
 
-    if (!authToken) {
+    if (!apiKey || !secret) {
       return res.json(
-        { error: "Missing VIDEOSDK_AUTH_TOKEN (JWT required)" },
+        { error: "Missing API key or secret" },
         503,
         CORS_HEADERS
       );
     }
 
-    // Debug only (safe: no secret exposed)
-    const decodedAuth = jwt.decode(authToken) || {};
-    const authApiKey = decodedAuth?.apikey || null;
-    log("Room function auth apikey:", authApiKey);
+    // ✅ Generate fresh JWT for room creation
+    const authToken = jwt.sign(
+      {
+        apikey: apiKey,
+        permissions: ["allow_join"], // enough for room creation
+      },
+      secret,
+      {
+        expiresIn: "1h",
+        algorithm: "HS256",
+      }
+    );
+
+    log("Creating VideoSDK room...");
 
     const response = await fetch(VIDEOSDK_ROOMS_URL, {
       method: "POST",
@@ -52,12 +62,12 @@ module.exports = async ({ req, res, log }) => {
 
     if (!response.ok) {
       log("Room creation failed", { status: response.status, data });
+
       return res.json(
         {
           error: "Failed to create VideoSDK room",
           status: response.status,
           details: data,
-          debug: { authApiKey },
         },
         response.status,
         CORS_HEADERS
@@ -68,7 +78,10 @@ module.exports = async ({ req, res, log }) => {
 
     if (!roomId) {
       return res.json(
-        { error: "No roomId returned", details: data, debug: { authApiKey } },
+        {
+          error: "No roomId returned",
+          details: data,
+        },
         502,
         CORS_HEADERS
       );
@@ -79,7 +92,6 @@ module.exports = async ({ req, res, log }) => {
     return res.json(
       {
         roomId,
-        debug: { authApiKey },
       },
       200,
       CORS_HEADERS
@@ -88,7 +100,10 @@ module.exports = async ({ req, res, log }) => {
     log("Room exception:", e?.message || e);
 
     return res.json(
-      { error: "Room creation failed", message: e?.message },
+      {
+        error: "Room creation failed",
+        message: e?.message,
+      },
       500,
       CORS_HEADERS
     );
