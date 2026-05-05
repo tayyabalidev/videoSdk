@@ -200,7 +200,7 @@ module.exports = async ({ req, res, log }) => {
       });
     }
 
-    // POST: create room + token atomically
+    // POST: creates room + token atomically
     const createdMeetingId = await createRoom(apiKey, secretKey);
     const token = buildMeetingToken({
       apiKey,
