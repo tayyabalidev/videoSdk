@@ -207,7 +207,8 @@ module.exports = async ({ req, res, log }) => {
       apiKey,
       secretKey,
       roomId: createdMeetingId,
-      participantId,
+      // Do not participant-bind host live tokens; strict participant binding can reject
+      // joins on production clients when client-side participant resolution diverges.
       permissions: ['allow_join', 'allow_mod'],
     });
     const claims = safeDecodeJwtNoVerify(token) || {};
