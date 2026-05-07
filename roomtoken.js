@@ -39,7 +39,7 @@ function parseQuery(req) {
   if (req.query && typeof req.query === 'object' && !Array.isArray(req.query)) {
     const r = req.query.roomId ?? req.query['roomId'];
     const p = req.query.participantId ?? req.query['participantId'];
-    if (r != null && r !== '' || p != null && p !== '') {
+    if ((r != null && r !== '') || (p != null && p !== '')) {
       return {
         roomId: r != null && r !== '' ? String(r) : '',
         participantId: p != null && p !== '' ? String(p) : '',
@@ -131,7 +131,9 @@ module.exports = async ({ req, res, log }) => {
     if (method === 'OPTIONS') {
       return res.send('', 204, cors);
     }
-    if (method !== 'GET' && method !== 'POST') return res.json({ error: 'Method not allowed' }, 405, cors);
+    if (method !== 'GET' && method !== 'POST') {
+      return res.json({ error: 'Method not allowed' }, 405, cors);
+    }
 
     const apiKey = String(process.env.VIDEOSDK_API_KEY || '').trim();
     const secretKey = String(process.env.VIDEOSDK_SECRET_KEY || '').trim();
@@ -150,6 +152,7 @@ module.exports = async ({ req, res, log }) => {
     const debugRequested =
       params.get('debug') === '1' ||
       (req.query && String(req.query.debug) === '1');
+
     if (healthRequested) {
       return res.json(
         {
@@ -179,6 +182,7 @@ module.exports = async ({ req, res, log }) => {
 
     if (method === 'GET') {
       if (!roomId) return res.json({ error: 'roomId is required' }, 400, cors);
+
       const token = buildMeetingToken({
         apiKey,
         secretKey,
@@ -186,6 +190,7 @@ module.exports = async ({ req, res, log }) => {
         participantId,
         permissions: ['allow_join'],
       });
+
       const claims = safeDecodeJwtNoVerify(token) || {};
       const debug = {
         requestedRoomId: roomId,
@@ -194,23 +199,26 @@ module.exports = async ({ req, res, log }) => {
         tokenApiKey: claims.apikey || null,
         tokenPermissions: Array.isArray(claims.permissions) ? claims.permissions : [],
       };
-      if (debugRequested || true) log(`videosdk-token GET debug ${JSON.stringify(debug)}`);
+
+      if (debugRequested) log(`videosdk-token GET debug ${JSON.stringify(debug)}`);
+
       return res.json({ token, debug }, 200, {
         ...cors,
         'Content-Type': 'application/json',
       });
     }
 
-    // POST: create room + token atomically
+    // POST: create room + host token atomically
     const createdMeetingId = await createRoom(apiKey, secretKey);
+
     const token = buildMeetingToken({
       apiKey,
       secretKey,
       roomId: createdMeetingId,
-      // Do not participant-bind host live tokens; strict participant binding can reject
-      // joins on production clients when client-side participant resolution diverges.
-      permissions: ['allow_join', 'allow_mod', 'hls', 'end', 'record'],
+      // No participant binding for host token to avoid identity mismatch closures.
+      permissions: ['allow_join', 'allow_mod'],
     });
+
     const claims = safeDecodeJwtNoVerify(token) || {};
     const debug = {
       requestedRoomId: createdMeetingId,
@@ -219,7 +227,9 @@ module.exports = async ({ req, res, log }) => {
       tokenApiKey: claims.apikey || null,
       tokenPermissions: Array.isArray(claims.permissions) ? claims.permissions : [],
     };
-    if (debugRequested || true) log(`videosdk-token POST debug ${JSON.stringify(debug)}`);
+
+    if (debugRequested) log(`videosdk-token POST debug ${JSON.stringify(debug)}`);
+
     return res.json({ meetingId: createdMeetingId, token, debug }, 200, {
       ...cors,
       'Content-Type': 'application/json',
@@ -239,9 +249,11 @@ module.exports = async ({ req, res, log }) => {
         cors
       );
     }
+
     try {
       log(String(e && e.message ? e.message : e));
     } catch (_) {}
+
     return res.json(
       { error: 'create-room-and-token failed', message: e.message || 'unknown' },
       500,
