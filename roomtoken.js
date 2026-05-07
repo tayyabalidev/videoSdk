@@ -194,7 +194,7 @@ module.exports = async ({ req, res, log }) => {
         tokenApiKey: claims.apikey || null,
         tokenPermissions: Array.isArray(claims.permissions) ? claims.permissions : [],
       };
-      if (debugRequested) log(`videosdk-token GET debug ${JSON.stringify(debug)}`);
+      if (debugRequested || true) log(`videosdk-token GET debug ${JSON.stringify(debug)}`);
       return res.json({ token, debug }, 200, {
         ...cors,
         'Content-Type': 'application/json',
@@ -219,7 +219,7 @@ module.exports = async ({ req, res, log }) => {
       tokenApiKey: claims.apikey || null,
       tokenPermissions: Array.isArray(claims.permissions) ? claims.permissions : [],
     };
-    if (debugRequested) log(`videosdk-token POST debug ${JSON.stringify(debug)}`);
+    if (debugRequested || true) log(`videosdk-token POST debug ${JSON.stringify(debug)}`);
     return res.json({ meetingId: createdMeetingId, token, debug }, 200, {
       ...cors,
       'Content-Type': 'application/json',
