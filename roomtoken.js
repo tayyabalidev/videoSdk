@@ -80,16 +80,18 @@ function buildRoomAuthToken(apiKey, secretKey) {
 }
 
 function buildMeetingToken({ apiKey, secretKey, roomId, participantId, permissions }) {
+  // VideoSDK validates JWT by apikey + signature + permissions. Embedding `participantId`
+  // here makes the SDK treat that id as authoritative; combined with MeetingProvider passing
+  // its own participantId, this has produced silent CONNECTING -> DISCONNECTED loops on
+  // @videosdk.live/react-native-sdk@0.10.x (iOS). Keep the payload minimal and proven.
+  // `roomId` / `participantId` are accepted as args for forward-compat but intentionally NOT
+  // written to the JWT. The function still consumes ?participantId=... for log/debug only.
+  void roomId;
+  void participantId;
   const payload = {
     apikey: apiKey,
     permissions: Array.isArray(permissions) && permissions.length > 0 ? permissions : ['allow_join'],
   };
-  if (roomId && typeof roomId === 'string' && roomId.trim()) {
-    payload.roomId = roomId.trim();
-  }
-  if (participantId && typeof participantId === 'string' && participantId.trim()) {
-    payload.participantId = participantId.trim();
-  }
   return jwt.sign(payload, secretKey, {
     expiresIn: '2h',
     algorithm: 'HS256',
