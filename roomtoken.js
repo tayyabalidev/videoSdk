@@ -84,6 +84,12 @@ function buildMeetingToken({ apiKey, secretKey, roomId, participantId, permissio
     apikey: apiKey,
     permissions: Array.isArray(permissions) && permissions.length > 0 ? permissions : ['allow_join'],
   };
+  if (roomId && typeof roomId === 'string' && roomId.trim()) {
+    payload.roomId = roomId.trim();
+  }
+  if (participantId && typeof participantId === 'string' && participantId.trim()) {
+    payload.participantId = participantId.trim();
+  }
   return jwt.sign(payload, secretKey, {
     expiresIn: '2h',
     algorithm: 'HS256',
