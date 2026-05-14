@@ -5,24 +5,28 @@
  *   URL:  POST https://...appwrite.run/...?[participantId=<hostAppwriteUserId>]&debug=1
  *   Body: ignored
  *   Returns: { meetingId, token, debug? }
- *   Host JWT claims: { apikey, permissions:['allow_join','allow_mod'], version:2, roomId, roles:['rtc'] }
+ *   Host JWT claims: { apikey, permissions:['allow_join','allow_mod'] } — minimal proven shape.
  *   `participantId` query param is logged for debug only — NOT embedded in the JWT.
  *
  * GET — mint viewer/caller JWT for an existing room (watch live / 1:1 audio-video):
  *   URL:  GET ...?roomId=<required>&participantId=<optional>
  *   Returns: { token, debug? }
- *   Viewer JWT claims: { apikey, permissions:['allow_join'], version:2, roomId, roles:['rtc'] }
+ *   Viewer JWT claims: { apikey, permissions:['allow_join'] } — minimal proven shape.
  *
  * Required env vars:
  *   VIDEOSDK_API_KEY
  *   VIDEOSDK_SECRET_KEY
  *
  * Notes:
- * - Room creation calls VideoSDK POST https://api.videosdk.live/v2/rooms with a short crawler JWT.
- * - Tokens are room-scoped (the `roomId` claim binds the JWT to a single meeting).
- * - `participantId` is intentionally NOT in the JWT — keeps it out of conflict with whatever
- *   MeetingProvider passes from the client, which was a source of CONNECTING→DISCONNECTED loops
- *   on @videosdk.live/react-native-sdk@0.10.x.
+ * - Room creation calls VideoSDK POST https://api.videosdk.live/v2/rooms with a short crawler JWT
+ *   (this token DOES require `version: 2` + `roles: ['crawler']` per VideoSDK docs).
+ * - Meeting/viewer tokens, by contrast, intentionally OMIT `version`, `roomId`, `roles`, and
+ *   `participantId` claims. Empirically on @videosdk.live/react-native-sdk@0.10.x with the
+ *   matching native pods (react-native-webrtc 0.0.24 / WebRTC-SDK 125.6422.07), adding those
+ *   claims causes signaling to silently reject the join handshake: the SDK sees
+ *   CONNECTING → DISCONNECTED in a loop, `connectedOnce` stays false, dashboard shows
+ *   "Session Initiating time: 0 ms" with no traces and no error events. Keep this payload
+ *   minimal until VideoSDK explicitly documents otherwise for v0.10.x React Native SDK.
  * - Must `return` every res.* (Appwrite requirement).
  */
 'use strict';
@@ -87,22 +91,26 @@ function buildRoomAuthToken(apiKey, secretKey) {
 }
 
 function buildMeetingToken({ apiKey, secretKey, roomId, permissions }) {
-  // Room-scoped meeting JWT. The `roomId` claim binds this token to a single meeting; the SDK
-  // rejects join attempts to any other room with this token. `roles: ['rtc']` marks the bearer
-  // as a media participant (vs the `crawler` role used for server-side room management).
-  // `participantId` is intentionally NOT embedded — when MeetingProvider also supplies its own
-  // participantId, the two authorities conflict and produce silent CONNECTING→DISCONNECTED
-  // loops on @videosdk.live/react-native-sdk@0.10.x.
+  // Minimal proven payload for @videosdk.live/react-native-sdk@0.10.x with
+  // @videosdk.live/react-native-webrtc@0.0.24 + WebRTC-SDK 125.6422.07.
+  //
+  // We previously tried adding `version: 2`, `roomId`, and `roles: ['rtc']` claims
+  // (per a community recommendation). On the iPhone X TestFlight build with the
+  // matching new native pods, that payload caused VideoSDK signaling to silently
+  // reject every join — CONNECTING → DISCONNECTED in <2s, `connectedOnce: false`,
+  // dashboard "Session Initiating time: 0 ms", no traces, no error events.
+  // Reverting to just { apikey, permissions } restores joinability.
+  //
+  // `roomId` is still accepted as an arg (and validated) so call sites stay
+  // self-documenting; it is intentionally NOT serialized into the JWT.
   if (!roomId || typeof roomId !== 'string' || !roomId.trim()) {
     throw new Error('buildMeetingToken: roomId is required');
   }
+  void roomId;
   const payload = {
     apikey: apiKey,
     permissions:
       Array.isArray(permissions) && permissions.length > 0 ? permissions : ['allow_join'],
-    version: 2,
-    roomId: String(roomId).trim(),
-    roles: ['rtc'],
   };
   return jwt.sign(payload, secretKey, {
     expiresIn: '2h',
