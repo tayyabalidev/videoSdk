@@ -20,10 +20,10 @@
  * Notes:
  * - Room creation calls VideoSDK POST https://api.videosdk.live/v2/rooms with a short crawler JWT
  *   (this token DOES require `version: 2` + `roles: ['crawler']` per VideoSDK docs).
- * - Meeting/viewer tokens use VideoSDK's documented RTC shape: `version: 2`, `roles: ['rtc']`,
- *   `roomId`, optional `participantId`. Without `version: 2`, roomId/participantId are ignored
- *   and the dashboard session shows 0 participants. Room-creation tokens use `roles: ['crawler']`
- *   only (see buildRoomAuthToken) — never use crawler JWT to join a meeting.
+ * - Meeting/viewer tokens: `version: 2` + `roomId` + permissions (+ optional `participantId`).
+ *   `version: 2` is required so roomId binds to the dashboard session. Do NOT add `roles: ['rtc']`
+ *   to meeting JWTs — on @videosdk.live/react-native-sdk@0.10.x that causes CONNECTING →
+ *   DISCONNECTED before CONNECTED. Crawler role is only for buildRoomAuthToken (POST /v2/rooms).
  * - Must `return` every res.* (Appwrite requirement).
  */
 'use strict';
@@ -88,8 +88,8 @@ function buildRoomAuthToken(apiKey, secretKey) {
 }
 
 function buildMeetingToken({ apiKey, secretKey, roomId, permissions, participantId }) {
-  // Official VideoSDK meeting token (docs: version 2 required when using roomId / participantId).
-  // roles: ['rtc'] — required to run Meeting/Room and appear in dashboard sessions.
+  // version: 2 + roomId → dashboard session + room binding (VideoSDK docs).
+  // Omit `roles` on meeting tokens — roles: ['rtc'] breaks RN SDK 0.10.x join handshake.
   if (!roomId || typeof roomId !== 'string' || !roomId.trim()) {
     throw new Error('buildMeetingToken: roomId is required');
   }
@@ -99,7 +99,6 @@ function buildMeetingToken({ apiKey, secretKey, roomId, permissions, participant
       Array.isArray(permissions) && permissions.length > 0 ? permissions : ['allow_join'],
     version: 2,
     roomId: roomId.trim(),
-    roles: ['rtc'],
   };
   const pid =
     participantId != null && String(participantId).trim() ? String(participantId).trim() : '';
