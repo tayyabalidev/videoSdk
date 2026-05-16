@@ -1,29 +1,23 @@
 /**
  * Appwrite Function — VideoSDK room + token service for ASAB (single endpoint, two verbs).
  *
- * POST — create meeting + mint host JWT (live broadcast start):
- *   URL:  POST https://...appwrite.run/...?[participantId=<hostAppwriteUserId>]&debug=1
- *   Body: ignored
- *   Returns: { meetingId, token, debug? }
- *   Host JWT claims: { apikey, roomId, participantId?, permissions:['allow_join','allow_mod'] }.
- *   Pass `participantId=<hostAppwriteUserId>` on POST so the host appears as that id in VideoSDK.
+ * POST — create room + mint publisher JWT (live host OR outgoing call caller):
+ *   URL:  POST https://...appwrite.run/...?participantId=<appwriteUserId>&debug=1
+ *   Returns: { meetingId, roomId, token, debug? }
+ *   JWT: version 2, roomId, participantId?, permissions ['allow_join','allow_mod'], no roles.
+ *   Used by: createLiveStream(), createCall() → caller joins immediately (dashboard participant 1).
  *
- * GET — mint viewer/caller JWT for an existing room (watch live / 1:1 audio-video):
- *   URL:  GET ...?roomId=<required>&participantId=<optional>
+ * GET — mint JWT for an existing room (call callee, live viewer, token refresh):
+ *   URL:  GET ...?roomId=<required>&participantId=<appwriteUserId>&purpose=viewer|call
  *   Returns: { token, debug? }
- *   Viewer JWT claims: { apikey, permissions:['allow_join'] } — minimal proven shape.
+ *   Default (purpose omitted or purpose=call): ['allow_join','allow_mod'] — RTC publish (callee).
+ *   purpose=viewer: ['allow_join'] only — live HLS viewer (mode VIEWER in app).
  *
- * Required env vars:
- *   VIDEOSDK_API_KEY
- *   VIDEOSDK_SECRET_KEY
+ * Required env vars: VIDEOSDK_API_KEY, VIDEOSDK_SECRET_KEY
  *
  * Notes:
- * - Room creation calls VideoSDK POST https://api.videosdk.live/v2/rooms with a short crawler JWT
- *   (this token DOES require `version: 2` + `roles: ['crawler']` per VideoSDK docs).
- * - Meeting/viewer tokens: `version: 2` + `roomId` + permissions (+ optional `participantId`).
- *   `version: 2` is required so roomId binds to the dashboard session. Do NOT add `roles: ['rtc']`
- *   to meeting JWTs — on @videosdk.live/react-native-sdk@0.10.x that causes CONNECTING →
- *   DISCONNECTED before CONNECTED. Crawler role is only for buildRoomAuthToken (POST /v2/rooms).
+ * - Room creation uses crawler JWT (version 2 + roles:['crawler']) — server-side only.
+ * - Meeting tokens: version 2 + roomId + permissions; never add roles:['rtc'] on meeting JWTs.
  * - Must `return` every res.* (Appwrite requirement).
  */
 'use strict';
@@ -48,13 +42,21 @@ function safeDecodeJwtNoVerify(token) {
 }
 
 function parseQuery(req) {
+  const fromParams = (params) => ({
+    roomId: params.get('roomId') || '',
+    participantId: params.get('participantId') || '',
+    purpose: (params.get('purpose') || '').trim().toLowerCase(),
+  });
+
   if (req.query && typeof req.query === 'object' && !Array.isArray(req.query)) {
     const r = req.query.roomId ?? req.query['roomId'];
     const p = req.query.participantId ?? req.query['participantId'];
-    if (r != null && r !== '' || p != null && p !== '') {
+    const purpose = req.query.purpose ?? req.query['purpose'];
+    if (r != null && r !== '' || p != null && p !== '' || purpose != null && purpose !== '') {
       return {
         roomId: r != null && r !== '' ? String(r) : '',
         participantId: p != null && p !== '' ? String(p) : '',
+        purpose: purpose != null && String(purpose).trim() ? String(purpose).trim().toLowerCase() : '',
       };
     }
   }
@@ -62,11 +64,13 @@ function parseQuery(req) {
     (typeof req.queryString === 'string' && req.queryString) ||
     (typeof req.url === 'string' && req.url.includes('?') ? req.url.split('?')[1] : '') ||
     '';
-  const params = new URLSearchParams(raw);
-  return {
-    roomId: params.get('roomId') || '',
-    participantId: params.get('participantId') || '',
-  };
+  return fromParams(new URLSearchParams(raw));
+}
+
+/** GET token permissions — match Node /get-token for RTC; viewer-only when purpose=viewer. */
+function permissionsForGetToken(purpose) {
+  if (purpose === 'viewer') return ['allow_join'];
+  return ['allow_join', 'allow_mod'];
 }
 
 function buildRoomAuthToken(apiKey, secretKey) {
@@ -158,7 +162,7 @@ module.exports = async ({ req, res, log }) => {
     const apiKey = String(process.env.VIDEOSDK_API_KEY || '').trim();
     const secretKey = String(process.env.VIDEOSDK_SECRET_KEY || '').trim();
 
-    const { roomId, participantId } = parseQuery(req);
+    const { roomId, participantId, purpose } = parseQuery(req);
     const qs =
       typeof req.queryString === 'string' && req.queryString
         ? req.queryString
@@ -179,7 +183,7 @@ module.exports = async ({ req, res, log }) => {
           videoSdkKeysPresent: Boolean(apiKey && secretKey),
           hint: !apiKey || !secretKey
             ? 'Add VIDEOSDK_API_KEY and VIDEOSDK_SECRET_KEY to this function (Settings → Variables), save, redeploy.'
-            : 'Keys present; POST for room+token, GET ?roomId=... for token-only.',
+            : 'Keys present; POST ?participantId= for room+token (calls/live), GET ?roomId=&participantId= for join.',
         },
         200,
         cors
@@ -201,16 +205,18 @@ module.exports = async ({ req, res, log }) => {
 
     if (method === 'GET') {
       if (!roomId) return res.json({ error: 'roomId is required' }, 400, cors);
+      const getPermissions = permissionsForGetToken(purpose);
       const token = buildMeetingToken({
         apiKey,
         secretKey,
         roomId: String(roomId),
-        permissions: ['allow_join'],
+        permissions: getPermissions,
         participantId: participantId || undefined,
       });
       const claims = safeDecodeJwtNoVerify(token) || {};
       const debug = {
-        flow: 'viewer-or-caller',
+        flow: purpose === 'viewer' ? 'live-viewer' : 'meeting-join',
+        purpose: purpose || 'call',
         requestedRoomId: roomId,
         queryParticipantId: participantId || null,
         tokenRoomId: claims.roomId || null,
@@ -238,7 +244,7 @@ module.exports = async ({ req, res, log }) => {
     });
     const claims = safeDecodeJwtNoVerify(token) || {};
     const debug = {
-      flow: 'live-host',
+      flow: 'room-create-and-publish',
       requestedRoomId: createdMeetingId,
       queryParticipantId: participantId || null,
       tokenRoomId: claims.roomId || null,
@@ -249,7 +255,10 @@ module.exports = async ({ req, res, log }) => {
       tokenParticipantId: claims.participantId || null,
     };
     if (debugRequested) log(`videosdk-token POST debug ${JSON.stringify(debug)}`);
-    return res.json({ meetingId: createdMeetingId, token, debug }, 200, {
+    return res.json(
+      { meetingId: createdMeetingId, roomId: createdMeetingId, token, debug },
+      200,
+      {
       ...cors,
       'Content-Type': 'application/json',
     });
