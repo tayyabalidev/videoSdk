@@ -11,7 +11,7 @@
  *   URL:  GET ...?roomId=<required>&participantId=<appwriteUserId>&purpose=viewer|call
  *   Returns: { token, debug? }
  *   Default (purpose omitted or purpose=call): ['allow_join','allow_mod'] — RTC publish (callee).
- *   purpose=viewer: ['allow_join'] only — live HLS viewer (mode VIEWER in app).
+ *   purpose=viewer|live: ['allow_join','allow_mod'] — interactive live (HLS + chat + guest stage).
  *
  * Required env vars: VIDEOSDK_API_KEY, VIDEOSDK_SECRET_KEY
  *
@@ -67,9 +67,9 @@ function parseQuery(req) {
   return fromParams(new URLSearchParams(raw));
 }
 
-/** GET token permissions — match Node /get-token for RTC; viewer-only when purpose=viewer. */
+/** GET token permissions — match Node /get-token for RTC; interactive live viewers need allow_mod for co-host. */
 function permissionsForGetToken(purpose) {
-  if (purpose === 'viewer') return ['allow_join'];
+  if (purpose === 'viewer' || purpose === 'live') return ['allow_join', 'allow_mod'];
   return ['allow_join', 'allow_mod'];
 }
 
