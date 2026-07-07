@@ -1,7 +1,7 @@
 /**
  * Appwrite Function — paid live stream processing (zero npm deps — uses fetch only).
  *
- * Entry file MUST be named index.js (or set Entrypoint in Appwrite Console).
+ * Entry file: index.js OR streamAccess.js (must match Appwrite Settings → Entrypoint).
  *
  * Routes:
  *   GET  /api/health
