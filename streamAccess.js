@@ -1,22 +1,14 @@
 /**
- * Appwrite Function — paid live stream processing (replaces Node server for Appwrite deploy).
+ * Appwrite Function — paid live stream processing (zero npm deps — uses fetch only).
  *
- * Routes (HTTP):
+ * Entry file MUST be named index.js (or set Entrypoint in Appwrite Console).
+ *
+ * Routes:
  *   GET  /api/health
  *   GET  /api/check-stream-access?streamId=&userId=
- *   POST /api/create-stream-access-payment-intent  { amount, currency, buyerId, hostId, streamId }
- *
- * Deploy in Appwrite Console, then set in app .env:
- *   EXPO_PUBLIC_PROCESSING_SERVER_URL=https://YOUR_FUNCTION_ID.nyc.appwrite.run
- *
- * Function variables: STRIPE_SECRET_KEY, APPWRITE_DATABASE_ID,
- *   APPWRITE_LIVE_STREAMS_COLLECTION_ID, APPWRITE_STREAM_PURCHASES_COLLECTION_ID
- * (APPWRITE_ENDPOINT / PROJECT_ID / API_KEY are injected at runtime or set manually)
+ *   POST /api/create-stream-access-payment-intent
  */
 'use strict';
-
-const axios = require('axios');
-const Stripe = require('stripe');
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -55,11 +47,20 @@ function isConfigured() {
   );
 }
 
+async function appwriteGet(url) {
+  const response = await fetch(url, { headers: appwriteHeaders() });
+  if (!response.ok) {
+    const err = new Error(`appwrite_get_failed (${response.status})`);
+    err.status = response.status;
+    throw err;
+  }
+  return response.json();
+}
+
 async function getDocument(collectionId, documentId) {
   const db = process.env.APPWRITE_DATABASE_ID;
   const url = `${appwriteBase()}/databases/${db}/collections/${collectionId}/documents/${documentId}`;
-  const { data } = await axios.get(url, { headers: appwriteHeaders() });
-  return data;
+  return appwriteGet(url);
 }
 
 async function listDocuments(collectionId, queries = []) {
@@ -68,7 +69,7 @@ async function listDocuments(collectionId, queries = []) {
   queries.forEach((q) => params.append('queries[]', q));
   const qs = params.toString();
   const url = `${appwriteBase()}/databases/${db}/collections/${collectionId}/documents${qs ? `?${qs}` : ''}`;
-  const { data } = await axios.get(url, { headers: appwriteHeaders() });
+  const data = await appwriteGet(url);
   return data?.documents || [];
 }
 
@@ -108,10 +109,42 @@ async function checkStreamAccess(streamId, userId) {
       ? { allowed: true }
       : { allowed: false, reason: 'payment_required' };
   } catch (error) {
-    const status = error?.response?.status;
+    const status = error?.status;
     if (status === 404) return { allowed: false, reason: 'stream_not_found' };
     return { allowed: false, reason: error?.message || 'access_check_failed' };
   }
+}
+
+async function createStripePaymentIntent({ amountInCents, currency, buyerId, hostId, streamId }) {
+  const key = String(process.env.STRIPE_SECRET_KEY || '').trim();
+  if (!key) {
+    throw new Error('STRIPE_SECRET_KEY is not set on this function');
+  }
+
+  const body = new URLSearchParams({
+    amount: String(amountInCents),
+    currency: String(currency || 'usd').toLowerCase(),
+    'automatic_payment_methods[enabled]': 'true',
+    'metadata[buyerId]': String(buyerId),
+    'metadata[hostId]': String(hostId),
+    'metadata[streamId]': String(streamId),
+    'metadata[type]': 'stream_access',
+  });
+
+  const response = await fetch('https://api.stripe.com/v1/payment_intents', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: body.toString(),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data?.error?.message || `Stripe error (${response.status})`);
+  }
+  return data;
 }
 
 function getPath(req) {
@@ -163,12 +196,6 @@ function getBodyJson(req) {
   }
 }
 
-function getStripe() {
-  const key = String(process.env.STRIPE_SECRET_KEY || '').trim();
-  if (!key) return null;
-  return new Stripe(key);
-}
-
 module.exports = async ({ req, res, log }) => {
   try {
     const method = String(req.method || 'GET').toUpperCase();
@@ -178,6 +205,18 @@ module.exports = async ({ req, res, log }) => {
 
     const path = getPath(req);
     const query = getQuery(req);
+
+    if (path === '/' || path === '') {
+      return res.json(
+        {
+          ok: true,
+          service: 'stream-access',
+          routes: ['/api/health', '/api/check-stream-access', '/api/create-stream-access-payment-intent'],
+        },
+        200,
+        cors
+      );
+    }
 
     if (path === '/api/health' || path.endsWith('/api/health')) {
       return res.json(
@@ -224,15 +263,6 @@ module.exports = async ({ req, res, log }) => {
         return res.json({ error: 'buyerId, hostId, and streamId are required' }, 400, cors);
       }
 
-      const stripe = getStripe();
-      if (!stripe) {
-        return res.json(
-          { error: 'Stripe not configured. Set STRIPE_SECRET_KEY on this function.' },
-          500,
-          cors
-        );
-      }
-
       if (isConfigured()) {
         const access = await checkStreamAccess(streamId, buyerId);
         if (access.allowed) {
@@ -241,16 +271,12 @@ module.exports = async ({ req, res, log }) => {
       }
 
       const amountInCents = Math.round(parseFloat(amount) * 100);
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: amountInCents,
-        currency: String(currency || 'usd').toLowerCase(),
-        metadata: {
-          buyerId: String(buyerId),
-          hostId: String(hostId),
-          streamId: String(streamId),
-          type: 'stream_access',
-        },
-        automatic_payment_methods: { enabled: true },
+      const paymentIntent = await createStripePaymentIntent({
+        amountInCents,
+        currency,
+        buyerId,
+        hostId,
+        streamId,
       });
 
       return res.json(
