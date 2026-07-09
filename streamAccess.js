@@ -96,8 +96,12 @@ async function checkStreamAccess(streamId, userId) {
       process.env.APPWRITE_LIVE_STREAMS_COLLECTION_ID,
       streamId
     );
-    if (!isPaidStream(stream)) return { allowed: true };
-    if (stream.hostId === userId) return { allowed: true };
+    if (!isPaidStream(stream)) {
+      return { allowed: true, reason: 'not_paid_stream' };
+    }
+    if (stream.hostId === userId) {
+      return { allowed: true, reason: 'host_access' };
+    }
 
     const purchases = await listDocuments(process.env.APPWRITE_STREAM_PURCHASES_COLLECTION_ID, [
       JSON.stringify({ method: 'equal', attribute: 'streamId', values: [streamId] }),
@@ -106,7 +110,7 @@ async function checkStreamAccess(streamId, userId) {
       JSON.stringify({ method: 'limit', values: [1] }),
     ]);
     return purchases.length > 0
-      ? { allowed: true }
+      ? { allowed: true, reason: 'purchase_verified' }
       : { allowed: false, reason: 'payment_required' };
   } catch (error) {
     const status = error?.status;
