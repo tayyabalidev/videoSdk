@@ -1,322 +1,171 @@
 /**
- * Appwrite Function — VideoSDK room + token service for ASAB (single endpoint, two verbs).
- *
- * POST — create room + mint publisher JWT (live host OR outgoing call caller):
- *   URL:  POST https://...appwrite.run/...?participantId=<appwriteUserId>&debug=1
- *   Returns: { meetingId, roomId, token, debug? }
- *   JWT: version 2, roomId, participantId?, permissions ['allow_join','allow_mod'], no roles.
- *   Used by: createLiveStream(), createCall() → caller joins immediately (dashboard participant 1).
- *
- * GET — mint JWT for an existing room (call callee, live viewer, token refresh):
- *   URL:  GET ...?roomId=<required>&participantId=<appwriteUserId>&purpose=viewer|call
- *   Returns: { token, debug? }
- *   Default (purpose omitted or purpose=call): ['allow_join','allow_mod'] — RTC publish (callee).
- *   purpose=viewer|live: ['allow_join','allow_mod'] — interactive live (HLS + chat + guest stage).
- *
- * Required env vars: VIDEOSDK_API_KEY, VIDEOSDK_SECRET_KEY
- * Paid live viewers (purpose=live|viewer): APPWRITE_* + APPWRITE_STREAM_PURCHASES_COLLECTION_ID
- *
- * Notes:
- * - Room creation uses crawler JWT (version 2 + roles:['crawler']) — server-side only.
- * - Meeting tokens: version 2 + roomId + permissions; never add roles:['rtc'] on meeting JWTs.
- * - Must `return` every res.* (Appwrite requirement).
+ * Appwrite-only paid stream check for VideoSDK token minting (no Stripe).
+ * Used by videosdk-token function and Node /get-token.
  */
 'use strict';
 
-const jwt = require('jsonwebtoken');
-const { checkLiveViewerTokenAccess } = require('./streamAccessCheck');
-const VIDEOSDK_ROOMS_URL = 'https://api.videosdk.live/v2/rooms';
-
-const cors = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Accept',
-};
-
-function safeDecodeJwtNoVerify(token) {
-  try {
-    if (!token || typeof token !== 'string') return null;
-    const decoded = jwt.decode(token);
-    return decoded && typeof decoded === 'object' ? decoded : null;
-  } catch (_) {
-    return null;
-  }
+function readEnv(key, fallback = '') {
+  const v = process.env[key];
+  return v != null && String(v).trim() ? String(v).trim() : fallback;
 }
 
-function parseQuery(req) {
-  const fromParams = (params) => ({
-    roomId: params.get('roomId') || '',
-    participantId: params.get('participantId') || '',
-    purpose: (params.get('purpose') || '').trim().toLowerCase(),
-    streamId: params.get('streamId') || '',
-    userId: params.get('userId') || '',
-  });
-
-  if (req.query && typeof req.query === 'object' && !Array.isArray(req.query)) {
-    const r = req.query.roomId ?? req.query['roomId'];
-    const p = req.query.participantId ?? req.query['participantId'];
-    const purpose = req.query.purpose ?? req.query['purpose'];
-    const streamId = req.query.streamId ?? req.query['streamId'];
-    const userId = req.query.userId ?? req.query['userId'];
-    if (r != null && r !== '' || p != null && p !== '' || purpose != null && purpose !== '' || streamId != null && streamId !== '' || userId != null && userId !== '') {
-      return {
-        roomId: r != null && r !== '' ? String(r) : '',
-        participantId: p != null && p !== '' ? String(p) : '',
-        purpose: purpose != null && String(purpose).trim() ? String(purpose).trim().toLowerCase() : '',
-        streamId: streamId != null && String(streamId).trim() ? String(streamId).trim() : '',
-        userId: userId != null && String(userId).trim() ? String(userId).trim() : '',
-      };
-    }
-  }
-  const raw =
-    (typeof req.queryString === 'string' && req.queryString) ||
-    (typeof req.url === 'string' && req.url.includes('?') ? req.url.split('?')[1] : '') ||
-    '';
-  return fromParams(new URLSearchParams(raw));
+function appwriteConfig() {
+  return {
+    endpoint: readEnv(
+      'APPWRITE_FUNCTION_API_ENDPOINT',
+      readEnv('APPWRITE_ENDPOINT', 'https://nyc.cloud.appwrite.io/v1')
+    ).replace(/\/$/, ''),
+    projectId: readEnv('APPWRITE_FUNCTION_PROJECT_ID', readEnv('APPWRITE_PROJECT_ID', '')),
+    apiKey: readEnv('APPWRITE_FUNCTION_API_KEY', readEnv('APPWRITE_API_KEY', '')),
+    databaseId: readEnv('APPWRITE_DATABASE_ID', ''),
+    liveStreamsCollectionId: readEnv(
+      'APPWRITE_LIVE_STREAMS_COLLECTION_ID',
+      '68f20f1f00332e083aff'
+    ),
+    streamPurchasesCollectionId: readEnv('APPWRITE_STREAM_PURCHASES_COLLECTION_ID', ''),
+  };
 }
 
-/** GET token permissions — match Node /get-token for RTC; interactive live viewers need allow_mod for co-host. */
-function permissionsForGetToken(purpose) {
-  if (purpose === 'viewer' || purpose === 'live') return ['allow_join', 'allow_mod'];
-  return ['allow_join', 'allow_mod'];
-}
-
-function buildRoomAuthToken(apiKey, secretKey) {
-  // Short-lived JWT used only against `POST https://api.videosdk.live/v2/rooms`.
-  // `roles: ['crawler']` is VideoSDK's server-side management role for room operations.
-  return jwt.sign(
-    {
-      apikey: apiKey,
-      permissions: ['allow_join', 'allow_mod'],
-      version: 2,
-      roles: ['crawler'],
-    },
-    secretKey,
-    {
-      algorithm: 'HS256',
-      expiresIn: '15m',
-    }
+function isBackendConfigured(cfg) {
+  return Boolean(
+    cfg.endpoint &&
+      cfg.projectId &&
+      cfg.apiKey &&
+      cfg.databaseId &&
+      cfg.liveStreamsCollectionId &&
+      cfg.streamPurchasesCollectionId
   );
 }
 
-function buildMeetingToken({ apiKey, secretKey, roomId, permissions, participantId }) {
-  // version: 2 + roomId → dashboard session + room binding (VideoSDK docs).
-  // Omit `roles` on meeting tokens — roles: ['rtc'] breaks RN SDK 0.10.x join handshake.
-  if (!roomId || typeof roomId !== 'string' || !roomId.trim()) {
-    throw new Error('buildMeetingToken: roomId is required');
+function isPaidStream(stream) {
+  if (!stream) return false;
+  if (stream.isPaid === true || stream.isPaid === 'true' || stream.isPaid === 1) {
+    const price = Number(stream.price);
+    return Number.isFinite(price) && price > 0;
   }
-  const payload = {
-    apikey: apiKey,
-    permissions:
-      Array.isArray(permissions) && permissions.length > 0 ? permissions : ['allow_join'],
-    version: 2,
-    roomId: roomId.trim(),
+  return false;
+}
+
+function appwriteHeaders(cfg) {
+  return {
+    'X-Appwrite-Project': cfg.projectId,
+    'X-Appwrite-Key': cfg.apiKey,
+    'Content-Type': 'application/json',
   };
-  const pid =
-    participantId != null && String(participantId).trim() ? String(participantId).trim() : '';
-  if (pid) payload.participantId = pid;
-  return jwt.sign(payload, secretKey, {
-    expiresIn: '2h',
-    algorithm: 'HS256',
-  });
 }
 
-async function createRoom(apiKey, secretKey) {
-  const authToken = buildRoomAuthToken(apiKey, secretKey);
-  const response = await fetch(VIDEOSDK_ROOMS_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: authToken,
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-    },
-    body: '{}',
-  });
-
-  const rawBody = await response.text();
-  let data = null;
-  try {
-    data = rawBody ? JSON.parse(rawBody) : null;
-  } catch (_) {
-    data = rawBody;
-  }
-
-  if (!response.ok) {
-    const err = new Error('Room creation failed');
-    err.status = response.status || 500;
-    err.details = data || rawBody || null;
-    throw err;
-  }
-
-  const roomId = data?.roomId || data?.room_id || data?.id || data?.meetingId || '';
-  if (!roomId) {
-    const err = new Error('Room API response missing roomId');
-    err.status = 502;
-    err.details = data || null;
-    throw err;
-  }
-  return String(roomId);
+function collectionDocsUrl(cfg, collectionId) {
+  return `${cfg.endpoint}/databases/${cfg.databaseId}/collections/${collectionId}/documents`;
 }
 
-module.exports = async ({ req, res, log }) => {
+async function appwriteGetDocument(cfg, collectionId, documentId) {
+  const url = `${collectionDocsUrl(cfg, collectionId)}/${encodeURIComponent(documentId)}`;
+  const res = await fetch(url, { headers: appwriteHeaders(cfg) });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Appwrite getDocument failed (${res.status}): ${body.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+async function appwriteListDocuments(cfg, collectionId, queryStrings) {
+  const qs = (queryStrings || [])
+    .map((q) => `queries[]=${encodeURIComponent(q)}`)
+    .join('&');
+  const url = `${collectionDocsUrl(cfg, collectionId)}?${qs}`;
+  const res = await fetch(url, { headers: appwriteHeaders(cfg) });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Appwrite listDocuments failed (${res.status}): ${body.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  return data.documents || [];
+}
+
+async function findCompletedPurchase(cfg, streamId, buyerId) {
+  const docs = await appwriteListDocuments(cfg, cfg.streamPurchasesCollectionId, [
+    `equal("streamId", ["${streamId}"])`,
+    `equal("buyerId", ["${buyerId}"])`,
+    `equal("status", ["completed"])`,
+    'limit(1)',
+  ]);
+  return docs[0] || null;
+}
+
+async function findStreamByRoomId(cfg, roomId) {
+  const rid = String(roomId || '').trim();
+  if (!rid) return null;
+  const docs = await appwriteListDocuments(cfg, cfg.liveStreamsCollectionId, [
+    `equal("videosdkRoomId", ["${rid}"])`,
+    'limit(1)',
+  ]);
+  return docs[0] || null;
+}
+
+/**
+ * Resolve stream doc by explicit streamId or VideoSDK roomId.
+ */
+async function resolveStreamDoc(cfg, { streamId, roomId }) {
+  const sid = String(streamId || '').trim();
+  if (sid) {
+    return appwriteGetDocument(cfg, cfg.liveStreamsCollectionId, sid);
+  }
+  return findStreamByRoomId(cfg, roomId);
+}
+
+/**
+ * Whether a live viewer may receive a VideoSDK meeting token.
+ * @returns {Promise<{ allowed: boolean, reason?: string, streamId?: string }>}
+ */
+async function checkLiveViewerTokenAccess({ streamId, roomId, userId }) {
+  const cfg = appwriteConfig();
+  const uid = String(userId || '').trim();
+
+  if (!uid) {
+    return { allowed: false, reason: 'missing_user' };
+  }
+
+  if (!isBackendConfigured(cfg)) {
+    return { allowed: false, reason: 'appwrite_not_configured' };
+  }
+
+  let stream;
   try {
-    const method = String(req.method || 'GET').toUpperCase();
-
-    if (method === 'OPTIONS') {
-      return res.send('', 204, cors);
-    }
-    if (method !== 'GET' && method !== 'POST') return res.json({ error: 'Method not allowed' }, 405, cors);
-
-    const apiKey = String(process.env.VIDEOSDK_API_KEY || '').trim();
-    const secretKey = String(process.env.VIDEOSDK_SECRET_KEY || '').trim();
-
-    const { roomId, participantId, purpose, streamId, userId } = parseQuery(req);
-    const accessUserId = userId || participantId;
-    const qs =
-      typeof req.queryString === 'string' && req.queryString
-        ? req.queryString
-        : typeof req.url === 'string' && req.url.includes('?')
-          ? req.url.split('?')[1]
-          : '';
-    const params = new URLSearchParams(qs);
-    const healthRequested =
-      params.get('health') === '1' ||
-      (req.query && String(req.query.health) === '1');
-    const debugRequested =
-      params.get('debug') === '1' ||
-      (req.query && String(req.query.debug) === '1');
-    if (healthRequested) {
-      return res.json(
-        {
-          ok: true,
-          videoSdkKeysPresent: Boolean(apiKey && secretKey),
-          hint: !apiKey || !secretKey
-            ? 'Add VIDEOSDK_API_KEY and VIDEOSDK_SECRET_KEY to this function (Settings → Variables), save, redeploy.'
-            : 'Keys present; POST ?participantId= for room+token (calls/live), GET ?roomId=&participantId= for join.',
-        },
-        200,
-        cors
-      );
-    }
-
-    if (!apiKey || !secretKey) {
-      log('Missing VIDEOSDK_API_KEY or VIDEOSDK_SECRET_KEY in function env');
-      return res.json(
-        {
-          error: 'VideoSDK not configured',
-          message:
-            'VIDEOSDK_API_KEY or VIDEOSDK_SECRET_KEY missing at runtime. Set them on this function in Appwrite, then redeploy.',
-        },
-        503,
-        cors
-      );
-    }
-
-    if (method === 'GET') {
-      if (!roomId) return res.json({ error: 'roomId is required' }, 400, cors);
-
-      const isLiveViewer = purpose === 'viewer' || purpose === 'live';
-      if (isLiveViewer) {
-        const access = await checkLiveViewerTokenAccess({
-          streamId,
-          roomId: String(roomId),
-          userId: accessUserId,
-        });
-        if (!access.allowed) {
-          if (debugRequested) {
-            log(`videosdk-token access denied ${JSON.stringify(access)}`);
-          }
-          return res.json(
-            {
-              error: 'Payment required',
-              reason: access.reason || 'payment_required',
-              streamId: access.streamId || streamId || null,
-            },
-            403,
-            cors
-          );
-        }
-      }
-
-      const getPermissions = permissionsForGetToken(purpose);
-      const token = buildMeetingToken({
-        apiKey,
-        secretKey,
-        roomId: String(roomId),
-        permissions: getPermissions,
-        participantId: participantId || undefined,
-      });
-      const claims = safeDecodeJwtNoVerify(token) || {};
-      const debug = {
-        flow: purpose === 'viewer' ? 'live-viewer' : 'meeting-join',
-        purpose: purpose || 'call',
-        requestedRoomId: roomId,
-        queryParticipantId: participantId || null,
-        tokenRoomId: claims.roomId || null,
-        tokenApiKey: claims.apikey || null,
-        tokenPermissions: Array.isArray(claims.permissions) ? claims.permissions : [],
-        tokenVersion: typeof claims.version === 'number' ? claims.version : null,
-        tokenRoles: Array.isArray(claims.roles) ? claims.roles : [],
-        tokenParticipantId: claims.participantId || null,
-      };
-      if (debugRequested) log(`videosdk-token GET debug ${JSON.stringify(debug)}`);
-      return res.json({ token, debug }, 200, {
-        ...cors,
-        'Content-Type': 'application/json',
-      });
-    }
-
-    // POST: create room + mint host token atomically.
-    const createdMeetingId = await createRoom(apiKey, secretKey);
-    const token = buildMeetingToken({
-      apiKey,
-      secretKey,
-      roomId: createdMeetingId,
-      permissions: ['allow_join', 'allow_mod'],
-      participantId: participantId || undefined,
-    });
-    const claims = safeDecodeJwtNoVerify(token) || {};
-    const debug = {
-      flow: 'room-create-and-publish',
-      requestedRoomId: createdMeetingId,
-      queryParticipantId: participantId || null,
-      tokenRoomId: claims.roomId || null,
-      tokenApiKey: claims.apikey || null,
-      tokenPermissions: Array.isArray(claims.permissions) ? claims.permissions : [],
-      tokenVersion: typeof claims.version === 'number' ? claims.version : null,
-      tokenRoles: Array.isArray(claims.roles) ? claims.roles : [],
-      tokenParticipantId: claims.participantId || null,
-    };
-    if (debugRequested) log(`videosdk-token POST debug ${JSON.stringify(debug)}`);
-    return res.json(
-      { meetingId: createdMeetingId, roomId: createdMeetingId, token, debug },
-      200,
-      {
-      ...cors,
-      'Content-Type': 'application/json',
-    });
+    stream = await resolveStreamDoc(cfg, { streamId, roomId });
   } catch (e) {
-    if (e && e.message === 'Room creation failed') {
-      return res.json(
-        { error: 'Room creation failed', details: e.details || null },
-        e.status || 500,
-        cors
-      );
-    }
-    if (e && e.message === 'Room API response missing roomId') {
-      return res.json(
-        { error: 'Room API missing roomId', details: e.details || null },
-        e.status || 502,
-        cors
-      );
-    }
-    try {
-      log(String(e && e.message ? e.message : e));
-    } catch (_) {}
-    return res.json(
-      { error: 'create-room-and-token failed', message: e.message || 'unknown' },
-      500,
-      cors
-    );
+    return { allowed: false, reason: 'server_error', message: e.message };
   }
+
+  if (!stream) {
+    // Unknown stream — allow token (free / legacy streams not in DB).
+    return { allowed: true, reason: 'stream_not_found' };
+  }
+
+  const resolvedStreamId = stream.$id;
+
+  if (!isPaidStream(stream)) {
+    return { allowed: true, reason: 'free_stream', streamId: resolvedStreamId };
+  }
+
+  if (String(stream.hostId || '') === uid) {
+    return { allowed: true, reason: 'host', streamId: resolvedStreamId };
+  }
+
+  try {
+    const purchase = await findCompletedPurchase(cfg, resolvedStreamId, uid);
+    if (purchase) {
+      return { allowed: true, reason: 'purchased', streamId: resolvedStreamId };
+    }
+  } catch (e) {
+    return { allowed: false, reason: 'server_error', message: e.message };
+  }
+
+  return { allowed: false, reason: 'payment_required', streamId: resolvedStreamId };
+}
+
+module.exports = {
+  checkLiveViewerTokenAccess,
+  findStreamByRoomId,
+  isPaidStream,
 };
