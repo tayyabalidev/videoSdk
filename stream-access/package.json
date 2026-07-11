@@ -1,0 +1,9 @@
+{
+  "name": "stream-access",
+  "version": "1.0.0",
+  "description": "Paid live stream access check and Stripe payment intents",
+  "main": "index.js",
+  "dependencies": {
+    "stripe": "^14.25.0"
+  }
+}
