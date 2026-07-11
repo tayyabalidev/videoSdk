@@ -294,6 +294,7 @@ async function createStreamAccessPaymentIntent(stripe, { streamId, buyerId }) {
   const { amount, platformFee, hostReceives } = calculateFees(priceCheck.price);
   const amountInCents = Math.round(amount * 100);
   const purchaseId = crypto.randomUUID().replace(/-/g, '').slice(0, 20);
+  const checkoutStartedAt = new Date().toISOString();
 
   await appwriteCreateDocument(cfg, cfg.streamPurchasesCollectionId, purchaseId, {
     streamId: sid,
@@ -305,7 +306,7 @@ async function createStreamAccessPaymentIntent(stripe, { streamId, buyerId }) {
     status: 'pending',
     paymentIntentId: '',
     currency: currency.toUpperCase(),
-    purchasedAt: null,
+    purchasedAt: checkoutStartedAt,
   });
 
   let paymentIntent;
