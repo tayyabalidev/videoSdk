@@ -71,6 +71,15 @@ function collectionDocsUrl(cfg, collectionId) {
   return `${cfg.endpoint}/databases/${cfg.databaseId}/collections/${collectionId}/documents`;
 }
 
+/** Appwrite 1.9+ REST queries must be JSON strings (not equal("attr", ["val"])). */
+function qEqual(attribute, value) {
+  return JSON.stringify({ method: 'equal', attribute, values: [String(value)] });
+}
+
+function qLimit(limit) {
+  return JSON.stringify({ method: 'limit', values: [Number(limit)] });
+}
+
 async function appwriteGetDocument(cfg, collectionId, documentId) {
   const url = `${collectionDocsUrl(cfg, collectionId)}/${encodeURIComponent(documentId)}`;
   const res = await fetch(url, { headers: appwriteHeaders(cfg) });
@@ -136,10 +145,10 @@ function isBackendConfigured(cfg) {
 
 async function findCompletedPurchase(cfg, streamId, buyerId) {
   const docs = await appwriteListDocuments(cfg, cfg.streamPurchasesCollectionId, [
-    `equal("streamId", ["${streamId}"])`,
-    `equal("buyerId", ["${buyerId}"])`,
-    `equal("status", ["completed"])`,
-    'limit(1)',
+    qEqual('streamId', streamId),
+    qEqual('buyerId', buyerId),
+    qEqual('status', 'completed'),
+    qLimit(1),
   ]);
   return docs[0] || null;
 }
@@ -147,8 +156,8 @@ async function findCompletedPurchase(cfg, streamId, buyerId) {
 async function findPurchaseByPaymentIntent(cfg, paymentIntentId) {
   if (!paymentIntentId) return null;
   const docs = await appwriteListDocuments(cfg, cfg.streamPurchasesCollectionId, [
-    `equal("paymentIntentId", ["${paymentIntentId}"])`,
-    'limit(1)',
+    qEqual('paymentIntentId', paymentIntentId),
+    qLimit(1),
   ]);
   return docs[0] || null;
 }
