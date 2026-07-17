@@ -15,9 +15,19 @@ const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
+
+function resolveMethod(req) {
+  // Appwrite may send lowercase, empty, or put method only in headers.
+  const headerMethod =
+    req?.headers?.['x-forwarded-method'] ||
+    req?.headers?.['X-Forwarded-Method'] ||
+    req?.headers?.['request-method'];
+  const raw = req?.method || headerMethod || 'POST';
+  return String(raw).trim().toUpperCase() || 'POST';
+}
 
 function appwriteHeaders() {
   const key =
@@ -58,6 +68,38 @@ function getBodyJson(req) {
   if (!text.trim()) return {};
   try {
     return JSON.parse(text);
+  } catch {
+    return {};
+  }
+}
+
+function getQueryJson(req) {
+  const raw = req.queryString || req.query || '';
+  if (!raw || typeof raw !== 'string') {
+    if (raw && typeof raw === 'object') return raw;
+    return {};
+  }
+  try {
+    const params = new URLSearchParams(raw.startsWith('?') ? raw.slice(1) : raw);
+    const out = {};
+    for (const [key, value] of params.entries()) {
+      out[key] = value;
+    }
+    if (typeof out.toUserIds === 'string') {
+      try {
+        out.toUserIds = JSON.parse(out.toUserIds);
+      } catch {
+        out.toUserIds = out.toUserIds.split(',').map((s) => s.trim()).filter(Boolean);
+      }
+    }
+    if (typeof out.data === 'string') {
+      try {
+        out.data = JSON.parse(out.data);
+      } catch {
+        /* keep string */
+      }
+    }
+    return out;
   } catch {
     return {};
   }
@@ -141,16 +183,19 @@ async function relayPush({ toUserIds, title, body, channelId, data, log }) {
 
 module.exports = async ({ req, res, log, error }) => {
   try {
-    const method = String(req.method || 'POST').toUpperCase();
+    // Accept GET + POST (Appwrite console / browser / some proxies use GET).
+    const method = resolveMethod(req);
+    log?.(`push-relay method=${method}`);
+
     if (method === 'OPTIONS') {
       return res.send('', 204, cors);
     }
 
-    if (method !== 'POST') {
-      return res.json({ error: 'Method not allowed' }, 405, cors);
+    if (method !== 'POST' && method !== 'GET') {
+      return res.json({ error: 'Method not allowed', method }, 405, cors);
     }
 
-    const body = getBodyJson(req);
+    const body = { ...getQueryJson(req), ...getBodyJson(req) };
     const result = await relayPush({
       toUserIds: body.toUserIds,
       title: body.title,
