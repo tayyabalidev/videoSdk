@@ -40,12 +40,13 @@ function safeJsonParse(text) {
 }
 
 function appwriteHeaders() {
+  // Prefer full API key — dynamic function key may lack scopes.
   const key =
-    process.env.APPWRITE_FUNCTION_API_KEY ||
-    process.env.APPWRITE_API_KEY;
+    process.env.APPWRITE_API_KEY ||
+    process.env.APPWRITE_FUNCTION_API_KEY;
   const project =
-    process.env.APPWRITE_FUNCTION_PROJECT_ID ||
-    process.env.APPWRITE_PROJECT_ID;
+    process.env.APPWRITE_PROJECT_ID ||
+    process.env.APPWRITE_FUNCTION_PROJECT_ID;
   return {
     'X-Appwrite-Project': project,
     'X-Appwrite-Key': key,
@@ -55,8 +56,8 @@ function appwriteHeaders() {
 
 function appwriteBase() {
   return (
-    process.env.APPWRITE_FUNCTION_API_ENDPOINT ||
     process.env.APPWRITE_ENDPOINT ||
+    process.env.APPWRITE_FUNCTION_API_ENDPOINT ||
     ''
   ).replace(/\/$/, '');
 }

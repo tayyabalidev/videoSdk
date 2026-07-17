@@ -53,12 +53,22 @@ function isPlatformBroadcaster({ userId, email }) {
 }
 
 function appwriteHeaders() {
+  // Prefer a full API key (APPWRITE_API_KEY) over the dynamic function key.
+  // Dynamic APPWRITE_FUNCTION_API_KEY often lacks databases.read/write scopes.
   const key =
-    process.env.APPWRITE_FUNCTION_API_KEY ||
-    process.env.APPWRITE_API_KEY;
+    process.env.APPWRITE_API_KEY ||
+    process.env.APPWRITE_FUNCTION_API_KEY;
   const project =
-    process.env.APPWRITE_FUNCTION_PROJECT_ID ||
-    process.env.APPWRITE_PROJECT_ID;
+    process.env.APPWRITE_PROJECT_ID ||
+    process.env.APPWRITE_FUNCTION_PROJECT_ID;
+  if (!key) {
+    throw new Error(
+      'Missing APPWRITE_API_KEY. Create an API key with databases.read + databases.write and add it to this function.'
+    );
+  }
+  if (!project) {
+    throw new Error('Missing APPWRITE_PROJECT_ID');
+  }
   return {
     'X-Appwrite-Project': project,
     'X-Appwrite-Key': key,
@@ -68,8 +78,8 @@ function appwriteHeaders() {
 
 function appwriteBase() {
   return (
-    process.env.APPWRITE_FUNCTION_API_ENDPOINT ||
     process.env.APPWRITE_ENDPOINT ||
+    process.env.APPWRITE_FUNCTION_API_ENDPOINT ||
     ''
   ).replace(/\/$/, '');
 }
@@ -152,6 +162,14 @@ async function fetchJson(url, options = {}) {
       `HTTP ${res.status}`;
     const err = new Error(message);
     err.status = res.status;
+    if (
+      res.status === 401 ||
+      res.status === 403 ||
+      String(message).toLowerCase().includes('not authorized')
+    ) {
+      err.message =
+        `${message} — Set function env APPWRITE_API_KEY to a full API key with scopes: databases.read, databases.write. Also set APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID, APPWRITE_NOTIFICATIONS_COLLECTION_ID.`;
+    }
     throw err;
   }
   return data;
