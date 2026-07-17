@@ -1,15 +1,16 @@
 /**
  * Appwrite Function — relay Expo push to specific users (reads expoPushToken via API key).
+ * Uses native fetch (no npm packages) so Appwrite deploy does not need axios install.
  *
  * Deploy in Appwrite Console, then in app .env:
  *   EXPO_PUBLIC_PUSH_RELAY_URL=https://your-function.nyc.appwrite.run
  *
  * Function variables:
  *   APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID
+ *   APPWRITE_API_KEY (or APPWRITE_FUNCTION_API_KEY)
+ *   APPWRITE_PROJECT_ID, APPWRITE_ENDPOINT (fallbacks if function injects are missing)
  */
 'use strict';
-
-const axios = require('axios');
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 
@@ -20,12 +21,12 @@ const cors = {
 };
 
 function appwriteHeaders() {
-  const endpoint = process.env.APPWRITE_FUNCTION_API_ENDPOINT || process.env.APPWRITE_ENDPOINT;
   const key =
     process.env.APPWRITE_FUNCTION_API_KEY ||
     process.env.APPWRITE_API_KEY;
   const project =
-    process.env.APPWRITE_FUNCTION_PROJECT_ID || process.env.APPWRITE_PROJECT_ID;
+    process.env.APPWRITE_FUNCTION_PROJECT_ID ||
+    process.env.APPWRITE_PROJECT_ID;
   return {
     'X-Appwrite-Project': project,
     'X-Appwrite-Key': key,
@@ -48,6 +49,9 @@ function userDocUrl(userId) {
 }
 
 function getBodyJson(req) {
+  if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+    return req.body;
+  }
   const text =
     (typeof req.bodyText === 'string' && req.bodyText) ||
     (typeof req.body === 'string' && req.body) ||
@@ -60,22 +64,49 @@ function getBodyJson(req) {
   }
 }
 
+async function fetchJson(url, options = {}) {
+  const res = await fetch(url, options);
+  const text = await res.text().catch(() => '');
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  if (!res.ok) {
+    const message =
+      (data && data.message) ||
+      (typeof data === 'string' ? data.slice(0, 200) : '') ||
+      `HTTP ${res.status}`;
+    const err = new Error(message);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
 async function relayPush({ toUserIds, title, body, channelId, data, log }) {
   const recipients = [...new Set((toUserIds || []).filter(Boolean))];
   if (!recipients.length) {
     return { pushed: 0, recipients: 0 };
   }
 
+  if (!appwriteBase() || !process.env.APPWRITE_DATABASE_ID || !process.env.APPWRITE_USER_COLLECTION_ID) {
+    throw new Error(
+      'Missing APPWRITE_ENDPOINT/APPWRITE_FUNCTION_API_ENDPOINT, APPWRITE_DATABASE_ID, or APPWRITE_USER_COLLECTION_ID'
+    );
+  }
+
   const tokens = [];
   for (const userId of recipients) {
     try {
-      const { data: user } = await axios.get(userDocUrl(userId), { headers: appwriteHeaders() });
+      const user = await fetchJson(userDocUrl(userId), { headers: appwriteHeaders() });
       const token = user?.expoPushToken;
       if (token && typeof token === 'string' && token.startsWith('ExponentPushToken')) {
         tokens.push(token);
       }
     } catch (_) {
-      /* skip */
+      /* skip missing users / permission errors */
     }
   }
 
@@ -95,8 +126,13 @@ async function relayPush({ toUserIds, title, body, channelId, data, log }) {
   }));
 
   for (let i = 0; i < messages.length; i += 100) {
-    await axios.post(EXPO_PUSH_URL, messages.slice(i, i + 100), {
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    await fetchJson(EXPO_PUSH_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(messages.slice(i, i + 100)),
     });
   }
 
@@ -106,11 +142,12 @@ async function relayPush({ toUserIds, title, body, channelId, data, log }) {
 
 module.exports = async ({ req, res, log, error }) => {
   try {
-    if (req.method === 'OPTIONS') {
-      return res.json('', 204, cors);
+    const method = String(req.method || 'POST').toUpperCase();
+    if (method === 'OPTIONS') {
+      return res.send('', 204, cors);
     }
 
-    if (req.method !== 'POST') {
+    if (method !== 'POST') {
       return res.json({ error: 'Method not allowed' }, 405, cors);
     }
 
