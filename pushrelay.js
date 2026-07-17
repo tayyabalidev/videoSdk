@@ -6,12 +6,10 @@
  *   EXPO_PUBLIC_PUSH_RELAY_URL=https://your-function.nyc.appwrite.run
  *
  * Function variables:
- *   APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID
  *   APPWRITE_API_KEY (or APPWRITE_FUNCTION_API_KEY)
  *   APPWRITE_PROJECT_ID, APPWRITE_ENDPOINT (fallbacks if function injects are missing)
  */
 'use strict';
-
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 
 const cors = {
