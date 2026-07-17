@@ -53,21 +53,25 @@ function isPlatformBroadcaster({ userId, email }) {
 }
 
 function appwriteHeaders() {
-  // Prefer a full API key (APPWRITE_API_KEY) over the dynamic function key.
-  // Dynamic APPWRITE_FUNCTION_API_KEY often lacks databases.read/write scopes.
+  // Prefer a full API key. Fall back to dynamic function key if scopes are enabled.
   const key =
-    process.env.APPWRITE_API_KEY ||
-    process.env.APPWRITE_FUNCTION_API_KEY;
+    (process.env.APPWRITE_API_KEY && String(process.env.APPWRITE_API_KEY).trim()) ||
+    (process.env.APPWRITE_FUNCTION_API_KEY && String(process.env.APPWRITE_FUNCTION_API_KEY).trim()) ||
+    '';
   const project =
-    process.env.APPWRITE_PROJECT_ID ||
-    process.env.APPWRITE_FUNCTION_PROJECT_ID;
+    (process.env.APPWRITE_PROJECT_ID && String(process.env.APPWRITE_PROJECT_ID).trim()) ||
+    (process.env.APPWRITE_FUNCTION_PROJECT_ID && String(process.env.APPWRITE_FUNCTION_PROJECT_ID).trim()) ||
+    '';
+
   if (!key) {
     throw new Error(
-      'Missing APPWRITE_API_KEY. Create an API key with databases.read + databases.write and add it to this function.'
+      'Missing API key. In Function Settings → Variables, add APPWRITE_API_KEY (API Keys → create key with databases.read + databases.write).'
     );
   }
   if (!project) {
-    throw new Error('Missing APPWRITE_PROJECT_ID');
+    throw new Error(
+      'Missing APPWRITE_PROJECT_ID. Add APPWRITE_PROJECT_ID=6854922e0036a1e8dee6 in Function Settings → Variables.'
+    );
   }
   return {
     'X-Appwrite-Project': project,
