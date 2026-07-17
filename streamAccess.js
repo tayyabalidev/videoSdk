@@ -1,169 +1,171 @@
 /**
- * Appwrite Function — relay Expo push to specific users (reads expoPushToken via API key).
- * Uses native fetch (no npm packages) so Appwrite deploy does not need axios install.
- *
- * Deploy in Appwrite Console, then in app .env:
- *   EXPO_PUBLIC_PUSH_RELAY_URL=https://your-function.nyc.appwrite.run
- *
- * Function variables:
- *   APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID
- *   APPWRITE_API_KEY (or APPWRITE_FUNCTION_API_KEY)
- *   APPWRITE_PROJECT_ID, APPWRITE_ENDPOINT (fallbacks if function injects are missing)
+ * Appwrite-only paid stream check for VideoSDK token minting (no Stripe).
+ * Used by videosdk-token function and Node /get-token.
  */
 'use strict';
 
-const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+function readEnv(key, fallback = '') {
+  const v = process.env[key];
+  return v != null && String(v).trim() ? String(v).trim() : fallback;
+}
 
-const cors = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-};
-
-function appwriteHeaders() {
-  const key =
-    process.env.APPWRITE_FUNCTION_API_KEY ||
-    process.env.APPWRITE_API_KEY;
-  const project =
-    process.env.APPWRITE_FUNCTION_PROJECT_ID ||
-    process.env.APPWRITE_PROJECT_ID;
+function appwriteConfig() {
   return {
-    'X-Appwrite-Project': project,
-    'X-Appwrite-Key': key,
+    endpoint: readEnv(
+      'APPWRITE_FUNCTION_API_ENDPOINT',
+      readEnv('APPWRITE_ENDPOINT', 'https://nyc.cloud.appwrite.io/v1')
+    ).replace(/\/$/, ''),
+    projectId: readEnv('APPWRITE_FUNCTION_PROJECT_ID', readEnv('APPWRITE_PROJECT_ID', '')),
+    apiKey: readEnv('APPWRITE_FUNCTION_API_KEY', readEnv('APPWRITE_API_KEY', '')),
+    databaseId: readEnv('APPWRITE_DATABASE_ID', ''),
+    liveStreamsCollectionId: readEnv(
+      'APPWRITE_LIVE_STREAMS_COLLECTION_ID',
+      '68f20f1f00332e083aff'
+    ),
+    streamPurchasesCollectionId: readEnv('APPWRITE_STREAM_PURCHASES_COLLECTION_ID', ''),
+  };
+}
+
+function isBackendConfigured(cfg) {
+  return Boolean(
+    cfg.endpoint &&
+      cfg.projectId &&
+      cfg.apiKey &&
+      cfg.databaseId &&
+      cfg.liveStreamsCollectionId &&
+      cfg.streamPurchasesCollectionId
+  );
+}
+
+function isPaidStream(stream) {
+  if (!stream) return false;
+  if (stream.isPaid === true || stream.isPaid === 'true' || stream.isPaid === 1) {
+    const price = Number(stream.price);
+    return Number.isFinite(price) && price > 0;
+  }
+  return false;
+}
+
+function appwriteHeaders(cfg) {
+  return {
+    'X-Appwrite-Project': cfg.projectId,
+    'X-Appwrite-Key': cfg.apiKey,
     'Content-Type': 'application/json',
   };
 }
 
-function appwriteBase() {
-  return (
-    process.env.APPWRITE_FUNCTION_API_ENDPOINT ||
-    process.env.APPWRITE_ENDPOINT ||
-    ''
-  ).replace(/\/$/, '');
+function collectionDocsUrl(cfg, collectionId) {
+  return `${cfg.endpoint}/databases/${cfg.databaseId}/collections/${collectionId}/documents`;
 }
 
-function userDocUrl(userId) {
-  const db = process.env.APPWRITE_DATABASE_ID;
-  const col = process.env.APPWRITE_USER_COLLECTION_ID;
-  return `${appwriteBase()}/databases/${db}/collections/${col}/documents/${userId}`;
-}
-
-function getBodyJson(req) {
-  if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
-    return req.body;
-  }
-  const text =
-    (typeof req.bodyText === 'string' && req.bodyText) ||
-    (typeof req.body === 'string' && req.body) ||
-    '';
-  if (!text.trim()) return {};
-  try {
-    return JSON.parse(text);
-  } catch {
-    return {};
-  }
-}
-
-async function fetchJson(url, options = {}) {
-  const res = await fetch(url, options);
-  const text = await res.text().catch(() => '');
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = text;
-  }
+async function appwriteGetDocument(cfg, collectionId, documentId) {
+  const url = `${collectionDocsUrl(cfg, collectionId)}/${encodeURIComponent(documentId)}`;
+  const res = await fetch(url, { headers: appwriteHeaders(cfg) });
+  if (res.status === 404) return null;
   if (!res.ok) {
-    const message =
-      (data && data.message) ||
-      (typeof data === 'string' ? data.slice(0, 200) : '') ||
-      `HTTP ${res.status}`;
-    const err = new Error(message);
-    err.status = res.status;
-    throw err;
+    const body = await res.text();
+    throw new Error(`Appwrite getDocument failed (${res.status}): ${body.slice(0, 200)}`);
   }
-  return data;
+  return res.json();
 }
 
-async function relayPush({ toUserIds, title, body, channelId, data, log }) {
-  const recipients = [...new Set((toUserIds || []).filter(Boolean))];
-  if (!recipients.length) {
-    return { pushed: 0, recipients: 0 };
+async function appwriteListDocuments(cfg, collectionId, queryStrings) {
+  const qs = (queryStrings || [])
+    .map((q) => `queries[]=${encodeURIComponent(q)}`)
+    .join('&');
+  const url = `${collectionDocsUrl(cfg, collectionId)}?${qs}`;
+  const res = await fetch(url, { headers: appwriteHeaders(cfg) });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Appwrite listDocuments failed (${res.status}): ${body.slice(0, 200)}`);
   }
-
-  if (!appwriteBase() || !process.env.APPWRITE_DATABASE_ID || !process.env.APPWRITE_USER_COLLECTION_ID) {
-    throw new Error(
-      'Missing APPWRITE_ENDPOINT/APPWRITE_FUNCTION_API_ENDPOINT, APPWRITE_DATABASE_ID, or APPWRITE_USER_COLLECTION_ID'
-    );
-  }
-
-  const tokens = [];
-  for (const userId of recipients) {
-    try {
-      const user = await fetchJson(userDocUrl(userId), { headers: appwriteHeaders() });
-      const token = user?.expoPushToken;
-      if (token && typeof token === 'string' && token.startsWith('ExponentPushToken')) {
-        tokens.push(token);
-      }
-    } catch (_) {
-      /* skip missing users / permission errors */
-    }
-  }
-
-  if (!tokens.length) {
-    log?.(`No push tokens for ${recipients.length} recipient(s)`);
-    return { pushed: 0, recipients: recipients.length };
-  }
-
-  const messages = tokens.map((token) => ({
-    to: token,
-    title: title || 'ASAB',
-    body: body || '',
-    sound: 'default',
-    priority: 'high',
-    channelId: channelId || undefined,
-    data: data && typeof data === 'object' ? data : undefined,
-  }));
-
-  for (let i = 0; i < messages.length; i += 100) {
-    await fetchJson(EXPO_PUSH_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify(messages.slice(i, i + 100)),
-    });
-  }
-
-  log?.(`Pushed to ${tokens.length} device(s)`);
-  return { pushed: tokens.length, recipients: recipients.length };
+  const data = await res.json();
+  return data.documents || [];
 }
 
-module.exports = async ({ req, res, log, error }) => {
+async function findCompletedPurchase(cfg, streamId, buyerId) {
+  const docs = await appwriteListDocuments(cfg, cfg.streamPurchasesCollectionId, [
+    `equal("streamId", ["${streamId}"])`,
+    `equal("buyerId", ["${buyerId}"])`,
+    `equal("status", ["completed"])`,
+    'limit(1)',
+  ]);
+  return docs[0] || null;
+}
+
+async function findStreamByRoomId(cfg, roomId) {
+  const rid = String(roomId || '').trim();
+  if (!rid) return null;
+  const docs = await appwriteListDocuments(cfg, cfg.liveStreamsCollectionId, [
+    `equal("videosdkRoomId", ["${rid}"])`,
+    'limit(1)',
+  ]);
+  return docs[0] || null;
+}
+
+/**
+ * Resolve stream doc by explicit streamId or VideoSDK roomId.
+ */
+async function resolveStreamDoc(cfg, { streamId, roomId }) {
+  const sid = String(streamId || '').trim();
+  if (sid) {
+    return appwriteGetDocument(cfg, cfg.liveStreamsCollectionId, sid);
+  }
+  return findStreamByRoomId(cfg, roomId);
+}
+
+/**
+ * Whether a live viewer may receive a VideoSDK meeting token.
+ * @returns {Promise<{ allowed: boolean, reason?: string, streamId?: string }>}
+ */
+async function checkLiveViewerTokenAccess({ streamId, roomId, userId }) {
+  const cfg = appwriteConfig();
+  const uid = String(userId || '').trim();
+
+  if (!uid) {
+    return { allowed: false, reason: 'missing_user' };
+  }
+
+  if (!isBackendConfigured(cfg)) {
+    return { allowed: false, reason: 'appwrite_not_configured' };
+  }
+
+  let stream;
   try {
-    const method = String(req.method || 'POST').toUpperCase();
-    if (method === 'OPTIONS') {
-      return res.send('', 204, cors);
-    }
-
-    if (method !== 'POST') {
-      return res.json({ error: 'Method not allowed' }, 405, cors);
-    }
-
-    const body = getBodyJson(req);
-    const result = await relayPush({
-      toUserIds: body.toUserIds,
-      title: body.title,
-      body: body.body,
-      channelId: body.channelId,
-      data: body.data,
-      log,
-    });
-
-    return res.json({ ok: true, ...result }, 200, cors);
-  } catch (err) {
-    error?.(err?.message || err);
-    return res.json({ error: err?.message || 'Push relay failed' }, 500, cors);
+    stream = await resolveStreamDoc(cfg, { streamId, roomId });
+  } catch (e) {
+    return { allowed: false, reason: 'server_error', message: e.message };
   }
+
+  if (!stream) {
+    // Unknown stream — allow token (free / legacy streams not in DB).
+    return { allowed: true, reason: 'stream_not_found' };
+  }
+
+  const resolvedStreamId = stream.$id;
+
+  if (!isPaidStream(stream)) {
+    return { allowed: true, reason: 'free_stream', streamId: resolvedStreamId };
+  }
+
+  if (String(stream.hostId || '') === uid) {
+    return { allowed: true, reason: 'host', streamId: resolvedStreamId };
+  }
+
+  try {
+    const purchase = await findCompletedPurchase(cfg, resolvedStreamId, uid);
+    if (purchase) {
+      return { allowed: true, reason: 'purchased', streamId: resolvedStreamId };
+    }
+  } catch (e) {
+    return { allowed: false, reason: 'server_error', message: e.message };
+  }
+
+  return { allowed: false, reason: 'payment_required', streamId: resolvedStreamId };
+}
+
+module.exports = {
+  checkLiveViewerTokenAccess,
+  findStreamByRoomId,
+  isPaidStream,
 };
