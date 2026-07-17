@@ -187,14 +187,16 @@ function qCursorAfter(documentId) {
   return JSON.stringify({ method: 'cursorAfter', values: [String(documentId)] });
 }
 
-async function listAllUserIds(excludeUserId) {
+/**
+ * One paginated pass — collect user ids + expoPushToken (no per-user getDocument).
+ */
+async function listAllUsers(excludeUserId) {
   const userCol = process.env.APPWRITE_USER_COLLECTION_ID;
-  const ids = [];
+  const users = [];
   let cursor = null;
   const pageSize = 100;
 
   while (true) {
-    // Appwrite 1.9+ REST queries must be JSON strings.
     const queries = [qLimit(pageSize)];
     if (cursor) queries.push(qCursorAfter(cursor));
     const qs = queries.map((q) => `queries[]=${encodeURIComponent(q)}`).join('&');
@@ -202,12 +204,16 @@ async function listAllUserIds(excludeUserId) {
       headers: appwriteHeaders(),
     });
     for (const doc of data.documents || []) {
-      if (!excludeUserId || doc.$id !== excludeUserId) ids.push(doc.$id);
+      if (excludeUserId && doc.$id === excludeUserId) continue;
+      users.push({
+        id: doc.$id,
+        expoPushToken: doc.expoPushToken || '',
+      });
     }
     if ((data.documents || []).length < pageSize) break;
     cursor = data.documents[data.documents.length - 1].$id;
   }
-  return ids;
+  return users;
 }
 
 async function createNotificationDoc(payload) {
@@ -221,7 +227,7 @@ async function createNotificationDoc(payload) {
   });
 }
 
-async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
+async function broadcast({ creatorUserId, creatorEmail, type, postId, skipInbox, log }) {
   if (!isPlatformBroadcaster({ userId: creatorUserId, email: creatorEmail })) {
     throw new Error(
       'Not authorized for platform broadcast. Set ADMIN_EMAILS and/or CEO_USER_ID on this function.'
@@ -235,36 +241,17 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
   const userCol = process.env.APPWRITE_USER_COLLECTION_ID;
   if (!userCol) throw new Error('APPWRITE_USER_COLLECTION_ID not configured');
 
+  const started = Date.now();
   const creator = await fetchJson(`${collectionUrl(userCol)}/${encodeURIComponent(creatorUserId)}`, {
     headers: appwriteHeaders(),
   });
 
   const fromUsername = creator?.username || 'ASAB';
   const fromUserAvatar = normalizeAvatar(creator?.avatar);
-  const recipientIds = await listAllUserIds(creatorUserId);
 
-  log?.(`Broadcast to ${recipientIds.length} users`);
-
-  const batchSize = 25;
-  let notified = 0;
-  for (let i = 0; i < recipientIds.length; i += batchSize) {
-    const batch = recipientIds.slice(i, i + batchSize);
-    await Promise.allSettled(
-      batch.map((targetUserId) =>
-        createNotificationDoc({
-          type,
-          fromUserId: creatorUserId,
-          fromUsername,
-          fromUserAvatar,
-          targetUserId,
-          postId: postId || null,
-          isRead: false,
-          createdAt: new Date().toISOString(),
-        })
-      )
-    );
-    notified += batch.length;
-  }
+  // Fast path: tokens come from listDocuments (avoids N× getDocument which caused timeouts).
+  const users = await listAllUsers(creatorUserId);
+  log?.(`Listed ${users.length} users in ${Date.now() - started}ms`);
 
   const platform = process.env.APP_PLATFORM || 'com.bilal.asab';
   let pushTitle = 'Admin posted new content.';
@@ -281,20 +268,14 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
         ? `${platform}://post/${encodeURIComponent(postId)}`
         : null;
 
-  const tokens = [];
-  for (const userId of recipientIds) {
-    try {
-      const user = await fetchJson(`${collectionUrl(userCol)}/${encodeURIComponent(userId)}`, {
-        headers: appwriteHeaders(),
-      });
-      const token = user?.expoPushToken;
-      if (token && String(token).startsWith('ExponentPushToken')) {
-        tokens.push(token);
-      }
-    } catch (_) {
-      /* skip */
-    }
-  }
+  const tokens = [
+    ...new Set(
+      users
+        .map((u) => u.expoPushToken)
+        .filter((t) => t && String(t).startsWith('ExponentPushToken'))
+        .map(String)
+    ),
+  ];
 
   const messages = tokens.map((token) => ({
     to: token,
@@ -313,12 +294,54 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
     },
   }));
 
+  // Push first — this is what users need immediately.
   const pushResult = await sendExpoPushMessages(messages, log);
+  log?.(`Pushed ${pushResult.pushed}/${tokens.length} in ${Date.now() - started}ms`);
+
+  let notified = 0;
+  let inboxSkipped = false;
+
+  // In-app inbox second (optional). Soft time budget to avoid Cloudflare 524 / Appwrite timeout.
+  const softDeadlineMs = Number(process.env.BROADCAST_SOFT_DEADLINE_MS || 45000);
+  if (!skipInbox && process.env.APPWRITE_NOTIFICATIONS_COLLECTION_ID) {
+    const batchSize = 40;
+    const createdAt = new Date().toISOString();
+    for (let i = 0; i < users.length; i += batchSize) {
+      if (Date.now() - started > softDeadlineMs) {
+        inboxSkipped = true;
+        log?.(
+          `Soft deadline reached after ${notified} inbox writes — returning push results to avoid timeout`
+        );
+        break;
+      }
+      const batch = users.slice(i, i + batchSize);
+      const results = await Promise.allSettled(
+        batch.map((user) =>
+          createNotificationDoc({
+            type,
+            fromUserId: creatorUserId,
+            fromUsername,
+            fromUserAvatar,
+            targetUserId: user.id,
+            postId: postId || null,
+            isRead: false,
+            createdAt,
+          })
+        )
+      );
+      notified += results.filter((r) => r.status === 'fulfilled').length;
+    }
+  } else {
+    inboxSkipped = true;
+  }
 
   return {
-    recipients: recipientIds.length,
+    recipients: users.length,
     notified,
     pushed: pushResult.pushed,
+    tokensFound: tokens.length,
+    inboxSkipped,
+    elapsedMs: Date.now() - started,
     pushErrors: pushResult.errors,
   };
 }
@@ -419,6 +442,10 @@ module.exports = async ({ req, res, log, error }) => {
 
     const body = { ...getQueryJson(req), ...getBodyJson(req) };
     const { creatorUserId, creatorEmail, type, postId } = body;
+    const skipInbox =
+      body.skipInbox === true ||
+      body.skipInbox === 'true' ||
+      body.skipInbox === '1';
 
     if (!creatorUserId || !type) {
       return res.json(
@@ -441,6 +468,7 @@ module.exports = async ({ req, res, log, error }) => {
       creatorEmail,
       type,
       postId,
+      skipInbox,
       log,
     });
 
