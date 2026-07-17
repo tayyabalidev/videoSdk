@@ -1,15 +1,16 @@
 /**
  * Appwrite Function — relay Expo push to specific users (reads expoPushToken via API key).
- * Uses native fetch (no npm packages) so Appwrite deploy does not need axios install.
+ * Uses native fetch (NO axios / no npm packages).
  *
- * Deploy in Appwrite Console, then in app .env:
- *   EXPO_PUBLIC_PUSH_RELAY_URL=https://your-function.nyc.appwrite.run
+ * Entrypoint for Appwrite: pushrelay.js
  *
  * Function variables:
+ *   APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID
  *   APPWRITE_API_KEY (or APPWRITE_FUNCTION_API_KEY)
  *   APPWRITE_PROJECT_ID, APPWRITE_ENDPOINT (fallbacks if function injects are missing)
  */
 'use strict';
+
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 
 const cors = {
