@@ -302,8 +302,15 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, skipInbox,
   let inboxSkipped = false;
 
   // In-app inbox second (optional). Soft time budget to avoid Cloudflare 524 / Appwrite timeout.
-  const softDeadlineMs = Number(process.env.BROADCAST_SOFT_DEADLINE_MS || 45000);
-  if (!skipInbox && process.env.APPWRITE_NOTIFICATIONS_COLLECTION_ID) {
+  const softDeadlineMs = Number(process.env.BROADCAST_SOFT_DEADLINE_MS || 25000);
+  // Default skip inbox on sync HTTP — inbox fan-out is what caused Cloudflare 524s.
+  // Pass skipInbox=false explicitly only when running as async Appwrite execution with high timeout.
+  const shouldSkipInbox =
+    skipInbox !== false &&
+    skipInbox !== 'false' &&
+    skipInbox !== '0';
+
+  if (!shouldSkipInbox && process.env.APPWRITE_NOTIFICATIONS_COLLECTION_ID) {
     const batchSize = 40;
     const createdAt = new Date().toISOString();
     for (let i = 0; i < users.length; i += batchSize) {
@@ -363,12 +370,25 @@ async function postExpoPush(messages) {
 /**
  * Expo requires all tokens in one request to share the same experience/project.
  * Mixed EAS project tokens cause PUSH_TOO_MANY_EXPERIENCE_IDS — split and retry.
+ * Never send hundreds sequentially (that causes Appwrite/Cloudflare timeouts).
  */
 async function sendExpoPushMessages(messages, log) {
   if (!messages.length) return { pushed: 0, errors: [] };
 
   const errors = [];
   let pushed = 0;
+
+  async function mapPool(items, concurrency, worker) {
+    const queue = [...items];
+    const runners = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+      while (queue.length) {
+        const item = queue.shift();
+        if (item === undefined) return;
+        await worker(item);
+      }
+    });
+    await Promise.all(runners);
+  }
 
   async function sendOneGroup(group) {
     if (!group.length) return;
@@ -378,11 +398,7 @@ async function sendExpoPushMessages(messages, log) {
       const err0 = result.data?.errors?.[0];
       const code = err0?.code || '';
 
-      if (
-        !result.ok &&
-        code === 'PUSH_TOO_MANY_EXPERIENCE_IDS' &&
-        chunk.length > 1
-      ) {
+      if (!result.ok && code === 'PUSH_TOO_MANY_EXPERIENCE_IDS' && chunk.length > 1) {
         const details = err0?.details && typeof err0.details === 'object' ? err0.details : null;
         if (details) {
           const byExperience = new Map();
@@ -391,19 +407,26 @@ async function sendExpoPushMessages(messages, log) {
             if (!byExperience.has(exp)) byExperience.set(exp, []);
             byExperience.get(exp).push(msg);
           }
-          log?.(
-            `Expo mixed experience IDs — splitting into ${byExperience.size} group(s)`
-          );
+          log?.(`Expo mixed experience IDs — splitting into ${byExperience.size} group(s)`);
           for (const [, subgroup] of byExperience) {
             await sendOneGroup(subgroup);
           }
           continue;
         }
 
-        log?.('Expo mixed experience IDs — sending one token at a time');
-        for (const msg of chunk) {
-          await sendOneGroup([msg]);
-        }
+        // No details: send singles in parallel (not sequential).
+        log?.(`Expo mixed experience IDs — parallel single sends (${chunk.length})`);
+        await mapPool(chunk, 15, async (msg) => {
+          const one = await postExpoPush([msg]);
+          if (one.ok) pushed += 1;
+          else {
+            const message =
+              one.data?.errors?.[0]?.message ||
+              (one.text && one.text.slice(0, 120)) ||
+              `Expo push HTTP ${one.status}`;
+            errors.push(message);
+          }
+        });
         continue;
       }
 
@@ -442,10 +465,13 @@ module.exports = async ({ req, res, log, error }) => {
 
     const body = { ...getQueryJson(req), ...getBodyJson(req) };
     const { creatorUserId, creatorEmail, type, postId } = body;
+    // Default: skip inbox (push-only). Set skipInbox=false to also write notifications.
     const skipInbox =
-      body.skipInbox === true ||
-      body.skipInbox === 'true' ||
-      body.skipInbox === '1';
+      !(
+        body.skipInbox === false ||
+        body.skipInbox === 'false' ||
+        body.skipInbox === '0'
+      );
 
     if (!creatorUserId || !type) {
       return res.json(
