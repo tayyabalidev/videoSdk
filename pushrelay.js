@@ -58,9 +58,21 @@ function userDocUrl(userId) {
 }
 
 function getBodyJson(req) {
+  // Preferred Appwrite field (already parsed).
+  if (req.bodyJson && typeof req.bodyJson === 'object' && !Array.isArray(req.bodyJson)) {
+    return req.bodyJson;
+  }
+
   // Appwrite may already parse JSON into an object.
   if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
-    // Some execute payloads wrap data: { body: "{...}" } or { payload: {...} }
+    // Execute API sometimes wraps: { data: "{...}" } or { body: "{...}" }
+    if (typeof req.body.data === 'string') {
+      try {
+        return JSON.parse(req.body.data);
+      } catch {
+        /* fall through */
+      }
+    }
     if (typeof req.body.body === 'string') {
       try {
         return JSON.parse(req.body.body);
@@ -78,6 +90,7 @@ function getBodyJson(req) {
 
   const candidates = [
     typeof req.bodyText === 'string' ? req.bodyText : '',
+    typeof req.bodyRaw === 'string' ? req.bodyRaw : '',
     typeof req.body === 'string' ? req.body : '',
     Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '',
     typeof req.payload === 'string' ? req.payload : '',
@@ -86,12 +99,33 @@ function getBodyJson(req) {
   for (const text of candidates) {
     if (!text || !String(text).trim()) continue;
     try {
-      return JSON.parse(String(text));
+      const parsed = JSON.parse(String(text));
+      // Executions API: { data: "{\"toUserIds\":[...]}" }
+      if (parsed && typeof parsed.data === 'string') {
+        try {
+          return JSON.parse(parsed.data);
+        } catch {
+          return parsed;
+        }
+      }
+      return parsed;
     } catch {
       /* try next */
     }
   }
   return {};
+}
+
+function bodyDebug(req) {
+  return {
+    method: req?.method || null,
+    hasBodyJson: Boolean(req?.bodyJson && typeof req.bodyJson === 'object'),
+    bodyTextLen: typeof req?.bodyText === 'string' ? req.bodyText.length : 0,
+    bodyRawLen: typeof req?.bodyRaw === 'string' ? req.bodyRaw.length : 0,
+    bodyType: req?.body == null ? 'null' : Array.isArray(req.body) ? 'array' : typeof req.body,
+    queryKeys: req?.query && typeof req.query === 'object' ? Object.keys(req.query) : [],
+    headerKeys: req?.headers && typeof req.headers === 'object' ? Object.keys(req.headers).slice(0, 20) : [],
+  };
 }
 
 function normalizeToUserIds(raw) {
@@ -239,8 +273,10 @@ module.exports = async ({ req, res, log, error }) => {
       return res.json(
         {
           error: 'toUserIds is required',
-          hint: 'POST JSON like {"toUserIds":["USER_DOCUMENT_ID"],"title":"Test","body":"Hello"}',
+          hint:
+            'POST to the Function Domain URL (Functions → push-relay → Domains), NOT /v1/functions/.../executions. Body: {"toUserIds":["USER_DOCUMENT_ID"],"title":"Test","body":"Hello"}',
           receivedKeys: Object.keys(parsed || {}),
+          debug: bodyDebug(req),
         },
         400,
         cors
