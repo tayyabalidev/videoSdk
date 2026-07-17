@@ -179,6 +179,14 @@ async function fetchJson(url, options = {}) {
   return data;
 }
 
+function qLimit(limit) {
+  return JSON.stringify({ method: 'limit', values: [Number(limit)] });
+}
+
+function qCursorAfter(documentId) {
+  return JSON.stringify({ method: 'cursorAfter', values: [String(documentId)] });
+}
+
 async function listAllUserIds(excludeUserId) {
   const userCol = process.env.APPWRITE_USER_COLLECTION_ID;
   const ids = [];
@@ -186,8 +194,9 @@ async function listAllUserIds(excludeUserId) {
   const pageSize = 100;
 
   while (true) {
-    const queries = [`limit(${pageSize})`];
-    if (cursor) queries.push(`cursorAfter("${cursor}")`);
+    // Appwrite 1.9+ REST queries must be JSON strings.
+    const queries = [qLimit(pageSize)];
+    if (cursor) queries.push(qCursorAfter(cursor));
     const qs = queries.map((q) => `queries[]=${encodeURIComponent(q)}`).join('&');
     const data = await fetchJson(`${collectionUrl(userCol)}?${qs}`, {
       headers: appwriteHeaders(),
