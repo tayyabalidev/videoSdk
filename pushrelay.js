@@ -58,19 +58,56 @@ function userDocUrl(userId) {
 }
 
 function getBodyJson(req) {
+  // Appwrite may already parse JSON into an object.
   if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
-    return req.body;
+    // Some execute payloads wrap data: { body: "{...}" } or { payload: {...} }
+    if (typeof req.body.body === 'string') {
+      try {
+        return JSON.parse(req.body.body);
+      } catch {
+        /* fall through */
+      }
+    }
+    if (req.body.payload && typeof req.body.payload === 'object') {
+      return req.body.payload;
+    }
+    if (Array.isArray(req.body.toUserIds) || req.body.toUserIds || req.body.title) {
+      return req.body;
+    }
   }
-  const text =
-    (typeof req.bodyText === 'string' && req.bodyText) ||
-    (typeof req.body === 'string' && req.body) ||
-    '';
-  if (!text.trim()) return {};
-  try {
-    return JSON.parse(text);
-  } catch {
-    return {};
+
+  const candidates = [
+    typeof req.bodyText === 'string' ? req.bodyText : '',
+    typeof req.body === 'string' ? req.body : '',
+    Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '',
+    typeof req.payload === 'string' ? req.payload : '',
+  ];
+
+  for (const text of candidates) {
+    if (!text || !String(text).trim()) continue;
+    try {
+      return JSON.parse(String(text));
+    } catch {
+      /* try next */
+    }
   }
+  return {};
+}
+
+function normalizeToUserIds(raw) {
+  if (Array.isArray(raw)) {
+    return raw.map(String).map((s) => s.trim()).filter(Boolean);
+  }
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return normalizeToUserIds(parsed);
+    } catch {
+      /* comma-separated */
+    }
+    return raw.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+  return [];
 }
 
 function getQueryJson(req) {
@@ -195,13 +232,27 @@ module.exports = async ({ req, res, log, error }) => {
       return res.json({ error: 'Method not allowed', method }, 405, cors);
     }
 
-    const body = { ...getQueryJson(req), ...getBodyJson(req) };
+    const parsed = { ...getQueryJson(req), ...getBodyJson(req) };
+    const toUserIds = normalizeToUserIds(parsed.toUserIds || parsed.userIds || parsed.userId);
+
+    if (!toUserIds.length) {
+      return res.json(
+        {
+          error: 'toUserIds is required',
+          hint: 'POST JSON like {"toUserIds":["USER_DOCUMENT_ID"],"title":"Test","body":"Hello"}',
+          receivedKeys: Object.keys(parsed || {}),
+        },
+        400,
+        cors
+      );
+    }
+
     const result = await relayPush({
-      toUserIds: body.toUserIds,
-      title: body.title,
-      body: body.body,
-      channelId: body.channelId,
-      data: body.data,
+      toUserIds,
+      title: parsed.title,
+      body: parsed.body,
+      channelId: parsed.channelId,
+      data: parsed.data,
       log,
     });
 
