@@ -209,15 +209,67 @@ async function sendExpoPush(messages, log) {
   });
   const text = await res.text().catch(() => '');
   const data = safeJsonParse(text);
-  if (!res.ok) {
-    throw new Error(
-      (data && data.message) ||
-        (text && text.slice(0, 200)) ||
-        `Expo push HTTP ${res.status}`
-    );
+  return { ok: res.ok, status: res.status, data, text };
+}
+
+/**
+ * Expo requires all tokens in one request to share the same experience/project.
+ * Mixed EAS project tokens cause PUSH_TOO_MANY_EXPERIENCE_IDS — split and retry.
+ */
+async function sendExpoPushMessages(messages, log) {
+  if (!messages.length) return { pushed: 0, errors: [] };
+
+  const errors = [];
+  let pushed = 0;
+
+  async function sendOneGroup(group) {
+    if (!group.length) return;
+    for (let i = 0; i < group.length; i += 100) {
+      const chunk = group.slice(i, i + 100);
+      const result = await sendExpoPush(chunk, log);
+      const err0 = result.data?.errors?.[0];
+      const code = err0?.code || '';
+
+      if (!result.ok && code === 'PUSH_TOO_MANY_EXPERIENCE_IDS' && chunk.length > 1) {
+        const details = err0?.details && typeof err0.details === 'object' ? err0.details : null;
+        if (details) {
+          const byExperience = new Map();
+          for (const msg of chunk) {
+            const exp = details[msg.to] || '__unknown__';
+            if (!byExperience.has(exp)) byExperience.set(exp, []);
+            byExperience.get(exp).push(msg);
+          }
+          log?.(`Expo mixed experience IDs — splitting into ${byExperience.size} group(s)`);
+          for (const [, subgroup] of byExperience) {
+            await sendOneGroup(subgroup);
+          }
+          continue;
+        }
+
+        log?.('Expo mixed experience IDs — sending one token at a time');
+        for (const msg of chunk) {
+          await sendOneGroup([msg]);
+        }
+        continue;
+      }
+
+      if (!result.ok) {
+        const message =
+          err0?.message ||
+          (result.text && result.text.slice(0, 200)) ||
+          `Expo push HTTP ${result.status}`;
+        errors.push(message);
+        log?.(`Expo push failed: ${message}`);
+        continue;
+      }
+
+      pushed += chunk.length;
+      log?.(`Expo push ok status=${result.status} count=${chunk.length}`);
+    }
   }
-  log?.(`Expo push status=${res.status} bodyLen=${(text || '').length}`);
-  return data;
+
+  await sendOneGroup(messages);
+  return { pushed, errors };
 }
 
 async function relayPush({ toUserIds, title, body, channelId, data, log }) {
@@ -233,8 +285,8 @@ async function relayPush({ toUserIds, title, body, channelId, data, log }) {
   }
 
   const key =
-    process.env.APPWRITE_FUNCTION_API_KEY ||
-    process.env.APPWRITE_API_KEY;
+    process.env.APPWRITE_API_KEY ||
+    process.env.APPWRITE_FUNCTION_API_KEY;
   if (!key) {
     throw new Error('Missing APPWRITE_API_KEY / APPWRITE_FUNCTION_API_KEY');
   }
@@ -268,11 +320,12 @@ async function relayPush({ toUserIds, title, body, channelId, data, log }) {
     data: data && typeof data === 'object' ? data : undefined,
   }));
 
-  for (let i = 0; i < messages.length; i += 100) {
-    await sendExpoPush(messages.slice(i, i + 100), log);
-  }
-
-  return { pushed: tokens.length, recipients: recipients.length };
+  const pushResult = await sendExpoPushMessages(messages, log);
+  return {
+    pushed: pushResult.pushed,
+    recipients: recipients.length,
+    pushErrors: pushResult.errors,
+  };
 }
 
 module.exports = async ({ req, res, log, error }) => {
