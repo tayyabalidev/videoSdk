@@ -20,13 +20,23 @@ const cors = {
 };
 
 function resolveMethod(req) {
-  // Appwrite may send lowercase, empty, or put method only in headers.
   const headerMethod =
     req?.headers?.['x-forwarded-method'] ||
     req?.headers?.['X-Forwarded-Method'] ||
     req?.headers?.['request-method'];
   const raw = req?.method || headerMethod || 'POST';
   return String(raw).trim().toUpperCase() || 'POST';
+}
+
+function safeJsonParse(text) {
+  if (text == null) return null;
+  const raw = String(text).trim();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
 }
 
 function appwriteHeaders() {
@@ -54,31 +64,46 @@ function appwriteBase() {
 function userDocUrl(userId) {
   const db = process.env.APPWRITE_DATABASE_ID;
   const col = process.env.APPWRITE_USER_COLLECTION_ID;
-  return `${appwriteBase()}/databases/${db}/collections/${col}/documents/${userId}`;
+  return `${appwriteBase()}/databases/${db}/collections/${col}/documents/${encodeURIComponent(userId)}`;
 }
 
 function getBodyJson(req) {
-  // Preferred Appwrite field (already parsed).
-  if (req.bodyJson && typeof req.bodyJson === 'object' && !Array.isArray(req.bodyJson)) {
-    return req.bodyJson;
+  // IMPORTANT: never read req.bodyJson unless body text exists.
+  // Appwrite lazily JSON.parses bodyJson and throws "Unexpected end of JSON input" on empty body.
+  const bodyText =
+    (typeof req.bodyText === 'string' && req.bodyText) ||
+    (typeof req.bodyRaw === 'string' && req.bodyRaw) ||
+    (typeof req.body === 'string' && req.body) ||
+    '';
+
+  if (bodyText && String(bodyText).trim()) {
+    const parsed = safeJsonParse(bodyText);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      if (typeof parsed.data === 'string') {
+        const nested = safeJsonParse(parsed.data);
+        if (nested && typeof nested === 'object') return nested;
+      }
+      return parsed;
+    }
   }
 
-  // Appwrite may already parse JSON into an object.
+  // Only touch bodyJson when we already know there is body text, or as last resort in try/catch.
+  try {
+    if (req.bodyJson && typeof req.bodyJson === 'object' && !Array.isArray(req.bodyJson)) {
+      return req.bodyJson;
+    }
+  } catch (_) {
+    /* empty body — Appwrite may throw while parsing bodyJson */
+  }
+
   if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
-    // Execute API sometimes wraps: { data: "{...}" } or { body: "{...}" }
     if (typeof req.body.data === 'string') {
-      try {
-        return JSON.parse(req.body.data);
-      } catch {
-        /* fall through */
-      }
+      const nested = safeJsonParse(req.body.data);
+      if (nested && typeof nested === 'object') return nested;
     }
     if (typeof req.body.body === 'string') {
-      try {
-        return JSON.parse(req.body.body);
-      } catch {
-        /* fall through */
-      }
+      const nested = safeJsonParse(req.body.body);
+      if (nested && typeof nested === 'object') return nested;
     }
     if (req.body.payload && typeof req.body.payload === 'object') {
       return req.body.payload;
@@ -88,43 +113,24 @@ function getBodyJson(req) {
     }
   }
 
-  const candidates = [
-    typeof req.bodyText === 'string' ? req.bodyText : '',
-    typeof req.bodyRaw === 'string' ? req.bodyRaw : '',
-    typeof req.body === 'string' ? req.body : '',
-    Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '',
-    typeof req.payload === 'string' ? req.payload : '',
-  ];
-
-  for (const text of candidates) {
-    if (!text || !String(text).trim()) continue;
-    try {
-      const parsed = JSON.parse(String(text));
-      // Executions API: { data: "{\"toUserIds\":[...]}" }
-      if (parsed && typeof parsed.data === 'string') {
-        try {
-          return JSON.parse(parsed.data);
-        } catch {
-          return parsed;
-        }
-      }
-      return parsed;
-    } catch {
-      /* try next */
-    }
-  }
   return {};
 }
 
 function bodyDebug(req) {
+  let bodyJsonSafe = false;
+  try {
+    bodyJsonSafe = Boolean(req?.bodyJson && typeof req.bodyJson === 'object');
+  } catch (_) {
+    bodyJsonSafe = false;
+  }
   return {
     method: req?.method || null,
-    hasBodyJson: Boolean(req?.bodyJson && typeof req.bodyJson === 'object'),
+    path: req?.path || null,
+    hasBodyJson: bodyJsonSafe,
     bodyTextLen: typeof req?.bodyText === 'string' ? req.bodyText.length : 0,
     bodyRawLen: typeof req?.bodyRaw === 'string' ? req.bodyRaw.length : 0,
     bodyType: req?.body == null ? 'null' : Array.isArray(req.body) ? 'array' : typeof req.body,
     queryKeys: req?.query && typeof req.query === 'object' ? Object.keys(req.query) : [],
-    headerKeys: req?.headers && typeof req.headers === 'object' ? Object.keys(req.headers).slice(0, 20) : [],
   };
 }
 
@@ -133,42 +139,40 @@ function normalizeToUserIds(raw) {
     return raw.map(String).map((s) => s.trim()).filter(Boolean);
   }
   if (typeof raw === 'string' && raw.trim()) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return normalizeToUserIds(parsed);
-    } catch {
-      /* comma-separated */
-    }
+    const parsed = safeJsonParse(raw);
+    if (Array.isArray(parsed)) return normalizeToUserIds(parsed);
     return raw.split(',').map((s) => s.trim()).filter(Boolean);
   }
   return [];
 }
 
 function getQueryJson(req) {
-  const raw = req.queryString || req.query || '';
-  if (!raw || typeof raw !== 'string') {
-    if (raw && typeof raw === 'object') return raw;
-    return {};
+  if (req.query && typeof req.query === 'object' && !Array.isArray(req.query)) {
+    const out = { ...req.query };
+    if (typeof out.toUserIds === 'string') {
+      const parsed = safeJsonParse(out.toUserIds);
+      out.toUserIds = Array.isArray(parsed)
+        ? parsed
+        : out.toUserIds.split(',').map((s) => s.trim()).filter(Boolean);
+    }
+    if (typeof out.data === 'string') {
+      const parsed = safeJsonParse(out.data);
+      if (parsed) out.data = parsed;
+    }
+    return out;
   }
+
+  const raw = req.queryString || '';
+  if (!raw || typeof raw !== 'string') return {};
   try {
     const params = new URLSearchParams(raw.startsWith('?') ? raw.slice(1) : raw);
     const out = {};
-    for (const [key, value] of params.entries()) {
-      out[key] = value;
-    }
+    for (const [key, value] of params.entries()) out[key] = value;
     if (typeof out.toUserIds === 'string') {
-      try {
-        out.toUserIds = JSON.parse(out.toUserIds);
-      } catch {
-        out.toUserIds = out.toUserIds.split(',').map((s) => s.trim()).filter(Boolean);
-      }
-    }
-    if (typeof out.data === 'string') {
-      try {
-        out.data = JSON.parse(out.data);
-      } catch {
-        /* keep string */
-      }
+      const parsed = safeJsonParse(out.toUserIds);
+      out.toUserIds = Array.isArray(parsed)
+        ? parsed
+        : out.toUserIds.split(',').map((s) => s.trim()).filter(Boolean);
     }
     return out;
   } catch {
@@ -179,16 +183,12 @@ function getQueryJson(req) {
 async function fetchJson(url, options = {}) {
   const res = await fetch(url, options);
   const text = await res.text().catch(() => '');
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = text;
-  }
+  const data = safeJsonParse(text);
+
   if (!res.ok) {
     const message =
       (data && data.message) ||
-      (typeof data === 'string' ? data.slice(0, 200) : '') ||
+      (text && String(text).trim().slice(0, 200)) ||
       `HTTP ${res.status}`;
     const err = new Error(message);
     err.status = res.status;
@@ -197,8 +197,30 @@ async function fetchJson(url, options = {}) {
   return data;
 }
 
+async function sendExpoPush(messages, log) {
+  const res = await fetch(EXPO_PUSH_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(messages),
+  });
+  const text = await res.text().catch(() => '');
+  const data = safeJsonParse(text);
+  if (!res.ok) {
+    throw new Error(
+      (data && data.message) ||
+        (text && text.slice(0, 200)) ||
+        `Expo push HTTP ${res.status}`
+    );
+  }
+  log?.(`Expo push status=${res.status} bodyLen=${(text || '').length}`);
+  return data;
+}
+
 async function relayPush({ toUserIds, title, body, channelId, data, log }) {
-  const recipients = [...new Set((toUserIds || []).filter(Boolean))];
+  const recipients = [...new Set((toUserIds || []).filter(Boolean).map(String))];
   if (!recipients.length) {
     return { pushed: 0, recipients: 0 };
   }
@@ -209,6 +231,13 @@ async function relayPush({ toUserIds, title, body, channelId, data, log }) {
     );
   }
 
+  const key =
+    process.env.APPWRITE_FUNCTION_API_KEY ||
+    process.env.APPWRITE_API_KEY;
+  if (!key) {
+    throw new Error('Missing APPWRITE_API_KEY / APPWRITE_FUNCTION_API_KEY');
+  }
+
   const tokens = [];
   for (const userId of recipients) {
     try {
@@ -216,14 +245,15 @@ async function relayPush({ toUserIds, title, body, channelId, data, log }) {
       const token = user?.expoPushToken;
       if (token && typeof token === 'string' && token.startsWith('ExponentPushToken')) {
         tokens.push(token);
+      } else {
+        log?.(`No expoPushToken for user ${userId}`);
       }
-    } catch (_) {
-      /* skip missing users / permission errors */
+    } catch (err) {
+      log?.(`Failed reading user ${userId}: ${err?.message || err}`);
     }
   }
 
   if (!tokens.length) {
-    log?.(`No push tokens for ${recipients.length} recipient(s)`);
     return { pushed: 0, recipients: recipients.length };
   }
 
@@ -238,27 +268,23 @@ async function relayPush({ toUserIds, title, body, channelId, data, log }) {
   }));
 
   for (let i = 0; i < messages.length; i += 100) {
-    await fetchJson(EXPO_PUSH_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify(messages.slice(i, i + 100)),
-    });
+    await sendExpoPush(messages.slice(i, i + 100), log);
   }
 
-  log?.(`Pushed to ${tokens.length} device(s)`);
   return { pushed: tokens.length, recipients: recipients.length };
 }
 
 module.exports = async ({ req, res, log, error }) => {
   try {
-    // Accept GET + POST (Appwrite console / browser / some proxies use GET).
-    const method = resolveMethod(req);
-    log?.(`push-relay method=${method}`);
+    const path = String(req.path || req.url || '/');
+    if (path.includes('favicon.ico')) {
+      return res.send('', 204, cors);
+    }
 
-    if (method === 'OPTIONS') {
+    const method = resolveMethod(req);
+    log?.(`push-relay method=${method} path=${path}`);
+
+    if (method === 'OPTIONS' || method === 'HEAD') {
       return res.send('', 204, cors);
     }
 
@@ -274,7 +300,7 @@ module.exports = async ({ req, res, log, error }) => {
         {
           error: 'toUserIds is required',
           hint:
-            'POST to the Function Domain URL (Functions → push-relay → Domains), NOT /v1/functions/.../executions. Body: {"toUserIds":["USER_DOCUMENT_ID"],"title":"Test","body":"Hello"}',
+            'POST JSON to the Function Domain URL (Functions → Domains). Example: {"toUserIds":["USER_DOCUMENT_ID"],"title":"Test","body":"Hello"}',
           receivedKeys: Object.keys(parsed || {}),
           debug: bodyDebug(req),
         },
@@ -295,6 +321,6 @@ module.exports = async ({ req, res, log, error }) => {
     return res.json({ ok: true, ...result }, 200, cors);
   } catch (err) {
     error?.(err?.message || err);
-    return res.json({ error: err?.message || 'Push relay failed' }, 500, cors);
+    return res.json({ error: String(err?.message || err || 'Push relay failed') }, 500, cors);
   }
 };
