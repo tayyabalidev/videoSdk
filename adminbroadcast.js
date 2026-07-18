@@ -263,9 +263,7 @@ async function listAllUsers(excludeUserId, log, deadlineAt) {
 }
 
 async function postExpoPush(messages) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
+  const work = (async () => {
     const res = await fetch(EXPO_PUSH_URL, {
       method: 'POST',
       headers: {
@@ -273,21 +271,37 @@ async function postExpoPush(messages) {
         Accept: 'application/json',
       },
       body: JSON.stringify(messages),
-      signal: controller.signal,
     });
     const text = await res.text().catch(() => '');
     const data = safeJsonParse(text);
     return { ok: res.ok, status: res.status, data, text };
-  } catch (e) {
-    if (e && e.name === 'AbortError') {
-      return { ok: false, status: 0, data: null, text: `Expo push timed out after ${FETCH_TIMEOUT_MS}ms` };
-    }
-    return { ok: false, status: 0, data: null, text: String(e && e.message ? e.message : e) };
+  })();
+
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(
+      () =>
+        resolve({
+          ok: false,
+          status: 0,
+          data: null,
+          text: `Expo push timed out after ${FETCH_TIMEOUT_MS}ms`,
+        }),
+      FETCH_TIMEOUT_MS
+    );
+  });
+
+  try {
+    return await Promise.race([work, timeout]);
   } finally {
     clearTimeout(timer);
   }
 }
 
+/**
+ * With mixed EAS experience IDs, batch sends fail. Always send one token at a time
+ * when recipient count is small (admin broadcast currently ~8 tokens).
+ */
 async function sendExpoPushMessages(messages, log, deadlineAt) {
   if (!messages.length) return { pushed: 0, errors: [], stoppedEarly: false };
 
@@ -295,91 +309,27 @@ async function sendExpoPushMessages(messages, log, deadlineAt) {
   let pushed = 0;
   let stoppedEarly = false;
 
-  async function mapPool(items, concurrency, worker) {
-    const queue = [...items];
-    const runners = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
-      while (queue.length) {
-        if (Date.now() >= deadlineAt) {
-          stoppedEarly = true;
-          queue.length = 0;
-          return;
-        }
-        const item = queue.shift();
-        if (item === undefined) return;
-        await worker(item);
-      }
-    });
-    await Promise.all(runners);
-  }
-
-  async function sendChunk(chunk) {
-    if (!chunk.length) return;
+  // Prefer singles — avoids PUSH_TOO_MANY_EXPERIENCE_IDS entirely.
+  for (let i = 0; i < messages.length; i += 1) {
     if (Date.now() >= deadlineAt) {
       stoppedEarly = true;
-      return;
-    }
-
-    const result = await postExpoPush(chunk);
-    const err0 = result.data?.errors?.[0];
-    const code = err0?.code || '';
-
-    if (!result.ok && code === 'PUSH_TOO_MANY_EXPERIENCE_IDS' && chunk.length > 1) {
-      const details = err0?.details && typeof err0.details === 'object' ? err0.details : null;
-      if (details) {
-        const byExperience = new Map();
-        for (const msg of chunk) {
-          const exp = details[msg.to] || '__unknown__';
-          if (!byExperience.has(exp)) byExperience.set(exp, []);
-          byExperience.get(exp).push(msg);
-        }
-        log?.(`Expo mixed experience IDs — splitting into ${byExperience.size} groups`);
-        for (const [, subgroup] of byExperience) {
-          if (Date.now() >= deadlineAt) {
-            stoppedEarly = true;
-            break;
-          }
-          await sendChunk(subgroup);
-        }
-        return;
-      }
-
-      // Cap singles so we never hang for minutes.
-      const singles = chunk.slice(0, 40);
-      log?.(`Expo mixed experience IDs — sending up to ${singles.length} singles`);
-      await mapPool(singles, 10, async (msg) => {
-        const one = await postExpoPush([msg]);
-        if (one.ok) pushed += 1;
-        else {
-          errors.push(
-            one.data?.errors?.[0]?.message ||
-              (one.text && one.text.slice(0, 120)) ||
-              `Expo push HTTP ${one.status}`
-          );
-        }
-      });
-      if (chunk.length > singles.length) stoppedEarly = true;
-      return;
-    }
-
-    if (!result.ok) {
-      const message =
-        err0?.message ||
-        (result.text && result.text.slice(0, 200)) ||
-        `Expo push HTTP ${result.status}`;
-      errors.push(message);
-      log?.(`Expo push failed: ${message}`);
-      return;
-    }
-
-    pushed += chunk.length;
-  }
-
-  for (let i = 0; i < messages.length; i += 100) {
-    if (Date.now() >= deadlineAt) {
-      stoppedEarly = true;
+      log?.(`Push stopped early after ${pushed}/${messages.length}`);
       break;
     }
-    await sendChunk(messages.slice(i, i + 100));
+
+    const one = await postExpoPush([messages[i]]);
+    if (one.ok) {
+      pushed += 1;
+      continue;
+    }
+
+    const err0 = one.data?.errors?.[0];
+    const message =
+      err0?.message ||
+      (one.text && String(one.text).slice(0, 160)) ||
+      `Expo push HTTP ${one.status}`;
+    errors.push(message);
+    log?.(`Expo push failed for token ${i + 1}/${messages.length}: ${message}`);
   }
 
   return { pushed, errors, stoppedEarly };
