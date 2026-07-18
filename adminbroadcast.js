@@ -1,13 +1,17 @@
 /**
- * Appwrite Function — admin/CEO content broadcast to all users (in-app + Expo push).
- * Simplified version: always sends push + creates in-app notifications.
- *
+ * Appwrite Function — admin/CEO content broadcast (Expo push + optional inbox).
  * Uses native fetch (NO axios).
+ *
+ * IMPORTANT: Do NOT write one notification document per user in a single Promise.all.
+ * That is what caused your 500 errors at exactly 5m (Appwrite timeout).
+ *
+ * Default: push-only (fast, reliable). Pass skipInbox=false to also write inbox docs.
  *
  * Function variables:
  *   APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID, APPWRITE_NOTIFICATIONS_COLLECTION_ID
  *   ADMIN_EMAILS (or CEO_USER_ID / CEO_USER_EMAIL)
  *   APP_PLATFORM=com.bilal.asab
+ *   APPWRITE_API_KEY, APPWRITE_PROJECT_ID, APPWRITE_ENDPOINT
  */
 'use strict';
 
@@ -131,6 +135,31 @@ function getQueryJson(req) {
   if (req.query && typeof req.query === 'object' && !Array.isArray(req.query)) {
     return { ...req.query };
   }
+
+  const raw = req.queryString || '';
+  if (raw && typeof raw === 'string') {
+    try {
+      const params = new URLSearchParams(raw.startsWith('?') ? raw.slice(1) : raw);
+      const out = {};
+      for (const [key, value] of params.entries()) out[key] = value;
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  try {
+    const url = String(req.url || '');
+    const qIndex = url.indexOf('?');
+    if (qIndex >= 0) {
+      const params = new URLSearchParams(url.slice(qIndex + 1));
+      const out = {};
+      for (const [key, value] of params.entries()) out[key] = value;
+      return out;
+    }
+  } catch (_) {
+    /* ignore */
+  }
   return {};
 }
 
@@ -153,9 +182,12 @@ async function fetchJson(url, options = {}) {
       `HTTP ${res.status}`;
     const err = new Error(message);
     err.status = res.status;
-
-    if (res.status === 401 || res.status === 403 || String(message).toLowerCase().includes('not authorized')) {
-      err.message = `${message} — Check APPWRITE_API_KEY (needs databases.read + databases.write) and required collection IDs.`;
+    if (
+      res.status === 401 ||
+      res.status === 403 ||
+      String(message).toLowerCase().includes('not authorized')
+    ) {
+      err.message = `${message} — Check APPWRITE_API_KEY (needs databases.read + databases.write) and collection IDs.`;
     }
     throw err;
   }
@@ -233,6 +265,18 @@ async function sendExpoPushMessages(messages, log) {
   const errors = [];
   let pushed = 0;
 
+  async function mapPool(items, concurrency, worker) {
+    const queue = [...items];
+    const runners = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+      while (queue.length) {
+        const item = queue.shift();
+        if (item === undefined) return;
+        await worker(item);
+      }
+    });
+    await Promise.all(runners);
+  }
+
   async function sendChunk(chunk) {
     if (!chunk.length) return;
     const result = await postExpoPush(chunk);
@@ -254,6 +298,20 @@ async function sendExpoPushMessages(messages, log) {
         }
         return;
       }
+
+      log?.(`Expo mixed experience IDs — parallel single sends (${chunk.length})`);
+      await mapPool(chunk, 15, async (msg) => {
+        const one = await postExpoPush([msg]);
+        if (one.ok) pushed += 1;
+        else {
+          errors.push(
+            one.data?.errors?.[0]?.message ||
+              (one.text && one.text.slice(0, 120)) ||
+              `Expo push HTTP ${one.status}`
+          );
+        }
+      });
+      return;
     }
 
     if (!result.ok) {
@@ -269,7 +327,6 @@ async function sendExpoPushMessages(messages, log) {
     pushed += chunk.length;
   }
 
-  // Send in chunks of 100 (Expo limit)
   for (let i = 0; i < messages.length; i += 100) {
     await sendChunk(messages.slice(i, i + 100));
   }
@@ -277,7 +334,7 @@ async function sendExpoPushMessages(messages, log) {
   return { pushed, errors };
 }
 
-async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
+async function broadcast({ creatorUserId, creatorEmail, type, postId, skipInbox, log }) {
   if (!isPlatformBroadcaster({ userId: creatorUserId, email: creatorEmail })) {
     throw new Error('Not authorized for platform broadcast. Configure ADMIN_EMAILS / CEO_USER_ID.');
   }
@@ -288,7 +345,6 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
 
   const started = Date.now();
 
-  // Get creator info
   const userCol = process.env.APPWRITE_USER_COLLECTION_ID;
   const creator = await fetchJson(`${collectionUrl(userCol)}/${encodeURIComponent(creatorUserId)}`, {
     headers: appwriteHeaders(),
@@ -297,7 +353,6 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
   const fromUsername = creator?.username || 'ASAB';
   const fromUserAvatar = normalizeAvatar(creator?.avatar);
 
-  // Get all users
   const users = await listAllUsers(creatorUserId);
   log?.(`Listed ${users.length} users in ${Date.now() - started}ms`);
 
@@ -316,7 +371,6 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
         ? `${platform}://post/${encodeURIComponent(postId)}`
         : null;
 
-  // Valid Expo tokens
   const tokens = [
     ...new Set(
       users
@@ -343,32 +397,56 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
     },
   }));
 
-  // Send push notifications
+  // Push first — this is what users need immediately.
   const pushResult = await sendExpoPushMessages(messages, log);
-  log?.(`Pushed ${pushResult.pushed} notifications in ${Date.now() - started}ms`);
+  log?.(`Pushed ${pushResult.pushed}/${tokens.length} in ${Date.now() - started}ms`);
 
-  // Create in-app notification documents
-  const createdAt = new Date().toISOString();
-  await Promise.all(
-    users.map((user) =>
-      createNotificationDoc({
-        type,
-        fromUserId: creatorUserId,
-        fromUsername,
-        fromUserAvatar,
-        targetUserId: user.id,
-        postId: postId || null,
-        isRead: false,
-        createdAt,
-      })
-    )
-  );
+  let notified = 0;
+  let inboxSkipped = true;
+
+  // Default: skip inbox. Writing N notification docs is what caused your 5m timeouts.
+  const wantInbox =
+    skipInbox === false || skipInbox === 'false' || skipInbox === '0';
+
+  if (wantInbox && process.env.APPWRITE_NOTIFICATIONS_COLLECTION_ID) {
+    inboxSkipped = false;
+    const softDeadlineMs = Number(process.env.BROADCAST_SOFT_DEADLINE_MS || 25000);
+    const batchSize = 40;
+    const createdAt = new Date().toISOString();
+
+    for (let i = 0; i < users.length; i += batchSize) {
+      if (Date.now() - started > softDeadlineMs) {
+        inboxSkipped = true;
+        log?.(
+          `Soft deadline after ${notified} inbox writes — returning push results to avoid timeout`
+        );
+        break;
+      }
+      const batch = users.slice(i, i + batchSize);
+      const results = await Promise.allSettled(
+        batch.map((user) =>
+          createNotificationDoc({
+            type,
+            fromUserId: creatorUserId,
+            fromUsername,
+            fromUserAvatar,
+            targetUserId: user.id,
+            postId: postId || null,
+            isRead: false,
+            createdAt,
+          })
+        )
+      );
+      notified += results.filter((r) => r.status === 'fulfilled').length;
+    }
+  }
 
   return {
     recipients: users.length,
-    notified: users.length,
+    notified,
     pushed: pushResult.pushed,
     tokensFound: tokens.length,
+    inboxSkipped,
     elapsedMs: Date.now() - started,
     pushErrors: pushResult.errors,
   };
@@ -386,17 +464,28 @@ module.exports = async ({ req, res, log, error }) => {
       return res.send('', 204, cors);
     }
     if (method !== 'POST' && method !== 'GET') {
-      return res.json({ error: 'Method not allowed' }, 405, cors);
+      return res.json({ error: 'Method not allowed', method }, 405, cors);
     }
 
     const body = { ...getQueryJson(req), ...getBodyJson(req) };
     const { creatorUserId, creatorEmail, type, postId } = body;
 
+    // Default skip inbox (push-only). Pass skipInbox=false to also write notifications.
+    const skipInbox = !(
+      body.skipInbox === false ||
+      body.skipInbox === 'false' ||
+      body.skipInbox === '0'
+    );
+
     if (!creatorUserId || !type) {
       return res.json(
         {
           error: 'creatorUserId and type required',
-          hint: 'POST JSON: {"creatorUserId":"...","creatorEmail":"...","type":"video_post","postId":"..."}',
+          hintPost:
+            'POST JSON: {"creatorUserId":"...","creatorEmail":"...","type":"video_post","postId":"..."}',
+          hintBrowser:
+            'https://YOUR_FUNCTION.nyc.appwrite.run/?creatorUserId=YOUR_CEO_ID&creatorEmail=YOU%40email.com&type=video_post&postId=browser-test',
+          method,
           receivedKeys: Object.keys(body || {}),
         },
         400,
@@ -413,6 +502,7 @@ module.exports = async ({ req, res, log, error }) => {
       creatorEmail,
       type,
       postId,
+      skipInbox,
       log,
     });
 
