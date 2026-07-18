@@ -1,23 +1,18 @@
 /**
  * Appwrite Function — admin/CEO content broadcast (Expo push + optional inbox).
- * Uses native fetch (NO axios).
+ * Entrypoint for manual upload: adminbroadcast.js
  *
- * IMPORTANT: Do NOT write one notification document per user in a single Promise.all.
- * That is what caused your 500 errors at exactly 5m (Appwrite timeout).
- *
- * Default: push-only (fast, reliable). Pass skipInbox=false to also write inbox docs.
- *
- * Function variables:
- *   APPWRITE_DATABASE_ID, APPWRITE_USER_COLLECTION_ID, APPWRITE_NOTIFICATIONS_COLLECTION_ID
- *   ADMIN_EMAILS (or CEO_USER_ID / CEO_USER_EMAIL)
- *   APP_PLATFORM=com.bilal.asab
- *   APPWRITE_API_KEY, APPWRITE_PROJECT_ID, APPWRITE_ENDPOINT
+ * Default: push-only (skip inbox) with hard time budget so Cloudflare/Appwrite
+ * do not hang for 5 minutes.
  */
 'use strict';
 
 const crypto = require('crypto');
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+const FETCH_TIMEOUT_MS = Number(process.env.BROADCAST_FETCH_TIMEOUT_MS || 12000);
+const TOTAL_BUDGET_MS = Number(process.env.BROADCAST_TOTAL_BUDGET_MS || 20000);
+const MAX_USER_PAGES = Number(process.env.BROADCAST_MAX_USER_PAGES || 30);
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -64,12 +59,8 @@ function appwriteHeaders() {
     (process.env.APPWRITE_FUNCTION_PROJECT_ID && String(process.env.APPWRITE_FUNCTION_PROJECT_ID).trim()) ||
     '';
 
-  if (!key) {
-    throw new Error('Missing APPWRITE_API_KEY. Add a key with databases.read + databases.write scopes.');
-  }
-  if (!project) {
-    throw new Error('Missing APPWRITE_PROJECT_ID.');
-  }
+  if (!key) throw new Error('Missing APPWRITE_API_KEY (databases.read + databases.write).');
+  if (!project) throw new Error('Missing APPWRITE_PROJECT_ID.');
   return {
     'X-Appwrite-Project': project,
     'X-Appwrite-Key': key,
@@ -171,27 +162,38 @@ function normalizeAvatar(avatar) {
 }
 
 async function fetchJson(url, options = {}) {
-  const res = await fetch(url, options);
-  const text = await res.text().catch(() => '');
-  const data = safeJsonParse(text);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    const text = await res.text().catch(() => '');
+    const data = safeJsonParse(text);
 
-  if (!res.ok) {
-    const message =
-      (data && data.message) ||
-      (text && String(text).trim().slice(0, 200)) ||
-      `HTTP ${res.status}`;
-    const err = new Error(message);
-    err.status = res.status;
-    if (
-      res.status === 401 ||
-      res.status === 403 ||
-      String(message).toLowerCase().includes('not authorized')
-    ) {
-      err.message = `${message} — Check APPWRITE_API_KEY (needs databases.read + databases.write) and collection IDs.`;
+    if (!res.ok) {
+      const message =
+        (data && data.message) ||
+        (text && String(text).trim().slice(0, 200)) ||
+        `HTTP ${res.status}`;
+      const err = new Error(message);
+      err.status = res.status;
+      if (
+        res.status === 401 ||
+        res.status === 403 ||
+        String(message).toLowerCase().includes('not authorized')
+      ) {
+        err.message = `${message} — Check APPWRITE_API_KEY and collection IDs.`;
+      }
+      throw err;
     }
-    throw err;
+    return data;
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      throw new Error(`Request timed out after ${FETCH_TIMEOUT_MS}ms: ${url.slice(0, 120)}`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
-  return data;
 }
 
 function qLimit(limit) {
@@ -202,15 +204,21 @@ function qCursorAfter(documentId) {
   return JSON.stringify({ method: 'cursorAfter', values: [String(documentId)] });
 }
 
-async function listAllUsers(excludeUserId) {
+async function listAllUsers(excludeUserId, log, deadlineAt) {
   const userCol = process.env.APPWRITE_USER_COLLECTION_ID;
   if (!userCol) throw new Error('APPWRITE_USER_COLLECTION_ID not configured');
 
   const users = [];
   let cursor = null;
   const pageSize = 100;
+  let pages = 0;
 
-  while (true) {
+  while (pages < MAX_USER_PAGES) {
+    if (Date.now() >= deadlineAt) {
+      log?.(`listAllUsers stopped early (budget) after ${pages} pages / ${users.length} users`);
+      break;
+    }
+
     const queries = [qLimit(pageSize)];
     if (cursor) queries.push(qCursorAfter(cursor));
 
@@ -219,7 +227,10 @@ async function listAllUsers(excludeUserId) {
       headers: appwriteHeaders(),
     });
 
-    for (const doc of data.documents || []) {
+    const docs = data.documents || [];
+    pages += 1;
+
+    for (const doc of docs) {
       if (excludeUserId && doc.$id === excludeUserId) continue;
       users.push({
         id: doc.$id,
@@ -227,48 +238,65 @@ async function listAllUsers(excludeUserId) {
       });
     }
 
-    if ((data.documents || []).length < pageSize) break;
-    cursor = data.documents[data.documents.length - 1].$id;
+    if (docs.length < pageSize) break;
+
+    const nextCursor = docs[docs.length - 1].$id;
+    if (!nextCursor || nextCursor === cursor) {
+      log?.('listAllUsers stopped: cursor did not advance');
+      break;
+    }
+    cursor = nextCursor;
   }
+
+  if (pages >= MAX_USER_PAGES) {
+    log?.(`listAllUsers hit MAX_USER_PAGES=${MAX_USER_PAGES} (${users.length} users)`);
+  }
+
   return users;
 }
 
-async function createNotificationDoc(payload) {
-  const notifCol = process.env.APPWRITE_NOTIFICATIONS_COLLECTION_ID;
-  if (!notifCol) throw new Error('APPWRITE_NOTIFICATIONS_COLLECTION_ID not configured');
-
-  const docId = crypto.randomUUID().replace(/-/g, '').slice(0, 20);
-  await fetchJson(collectionUrl(notifCol), {
-    method: 'POST',
-    headers: appwriteHeaders(),
-    body: JSON.stringify({ documentId: docId, data: payload }),
-  });
-}
-
 async function postExpoPush(messages) {
-  const res = await fetch(EXPO_PUSH_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: JSON.stringify(messages),
-  });
-  const text = await res.text().catch(() => '');
-  const data = safeJsonParse(text);
-  return { ok: res.ok, status: res.status, data, text };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(EXPO_PUSH_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(messages),
+      signal: controller.signal,
+    });
+    const text = await res.text().catch(() => '');
+    const data = safeJsonParse(text);
+    return { ok: res.ok, status: res.status, data, text };
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      return { ok: false, status: 0, data: null, text: `Expo push timed out after ${FETCH_TIMEOUT_MS}ms` };
+    }
+    return { ok: false, status: 0, data: null, text: String(e && e.message ? e.message : e) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-async function sendExpoPushMessages(messages, log) {
-  if (!messages.length) return { pushed: 0, errors: [] };
+async function sendExpoPushMessages(messages, log, deadlineAt) {
+  if (!messages.length) return { pushed: 0, errors: [], stoppedEarly: false };
 
   const errors = [];
   let pushed = 0;
+  let stoppedEarly = false;
 
   async function mapPool(items, concurrency, worker) {
     const queue = [...items];
     const runners = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
       while (queue.length) {
+        if (Date.now() >= deadlineAt) {
+          stoppedEarly = true;
+          queue.length = 0;
+          return;
+        }
         const item = queue.shift();
         if (item === undefined) return;
         await worker(item);
@@ -279,6 +307,11 @@ async function sendExpoPushMessages(messages, log) {
 
   async function sendChunk(chunk) {
     if (!chunk.length) return;
+    if (Date.now() >= deadlineAt) {
+      stoppedEarly = true;
+      return;
+    }
+
     const result = await postExpoPush(chunk);
     const err0 = result.data?.errors?.[0];
     const code = err0?.code || '';
@@ -294,13 +327,19 @@ async function sendExpoPushMessages(messages, log) {
         }
         log?.(`Expo mixed experience IDs — splitting into ${byExperience.size} groups`);
         for (const [, subgroup] of byExperience) {
+          if (Date.now() >= deadlineAt) {
+            stoppedEarly = true;
+            break;
+          }
           await sendChunk(subgroup);
         }
         return;
       }
 
-      log?.(`Expo mixed experience IDs — parallel single sends (${chunk.length})`);
-      await mapPool(chunk, 15, async (msg) => {
+      // Cap singles so we never hang for minutes.
+      const singles = chunk.slice(0, 40);
+      log?.(`Expo mixed experience IDs — sending up to ${singles.length} singles`);
+      await mapPool(singles, 10, async (msg) => {
         const one = await postExpoPush([msg]);
         if (one.ok) pushed += 1;
         else {
@@ -311,6 +350,7 @@ async function sendExpoPushMessages(messages, log) {
           );
         }
       });
+      if (chunk.length > singles.length) stoppedEarly = true;
       return;
     }
 
@@ -328,13 +368,17 @@ async function sendExpoPushMessages(messages, log) {
   }
 
   for (let i = 0; i < messages.length; i += 100) {
+    if (Date.now() >= deadlineAt) {
+      stoppedEarly = true;
+      break;
+    }
     await sendChunk(messages.slice(i, i + 100));
   }
 
-  return { pushed, errors };
+  return { pushed, errors, stoppedEarly };
 }
 
-async function broadcast({ creatorUserId, creatorEmail, type, postId, skipInbox, log }) {
+async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
   if (!isPlatformBroadcaster({ userId: creatorUserId, email: creatorEmail })) {
     throw new Error('Not authorized for platform broadcast. Configure ADMIN_EMAILS / CEO_USER_ID.');
   }
@@ -344,16 +388,14 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, skipInbox,
   }
 
   const started = Date.now();
+  const deadlineAt = started + TOTAL_BUDGET_MS;
 
   const userCol = process.env.APPWRITE_USER_COLLECTION_ID;
   const creator = await fetchJson(`${collectionUrl(userCol)}/${encodeURIComponent(creatorUserId)}`, {
     headers: appwriteHeaders(),
   });
 
-  const fromUsername = creator?.username || 'ASAB';
-  const fromUserAvatar = normalizeAvatar(creator?.avatar);
-
-  const users = await listAllUsers(creatorUserId);
+  const users = await listAllUsers(creatorUserId, log, deadlineAt);
   log?.(`Listed ${users.length} users in ${Date.now() - started}ms`);
 
   const platform = process.env.APP_PLATFORM || 'com.bilal.asab';
@@ -397,58 +439,18 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, skipInbox,
     },
   }));
 
-  // Push first — this is what users need immediately.
-  const pushResult = await sendExpoPushMessages(messages, log);
+  const pushResult = await sendExpoPushMessages(messages, log, deadlineAt);
   log?.(`Pushed ${pushResult.pushed}/${tokens.length} in ${Date.now() - started}ms`);
-
-  let notified = 0;
-  let inboxSkipped = true;
-
-  // Default: skip inbox. Writing N notification docs is what caused your 5m timeouts.
-  const wantInbox =
-    skipInbox === false || skipInbox === 'false' || skipInbox === '0';
-
-  if (wantInbox && process.env.APPWRITE_NOTIFICATIONS_COLLECTION_ID) {
-    inboxSkipped = false;
-    const softDeadlineMs = Number(process.env.BROADCAST_SOFT_DEADLINE_MS || 25000);
-    const batchSize = 40;
-    const createdAt = new Date().toISOString();
-
-    for (let i = 0; i < users.length; i += batchSize) {
-      if (Date.now() - started > softDeadlineMs) {
-        inboxSkipped = true;
-        log?.(
-          `Soft deadline after ${notified} inbox writes — returning push results to avoid timeout`
-        );
-        break;
-      }
-      const batch = users.slice(i, i + batchSize);
-      const results = await Promise.allSettled(
-        batch.map((user) =>
-          createNotificationDoc({
-            type,
-            fromUserId: creatorUserId,
-            fromUsername,
-            fromUserAvatar,
-            targetUserId: user.id,
-            postId: postId || null,
-            isRead: false,
-            createdAt,
-          })
-        )
-      );
-      notified += results.filter((r) => r.status === 'fulfilled').length;
-    }
-  }
 
   return {
     recipients: users.length,
-    notified,
+    notified: 0,
     pushed: pushResult.pushed,
     tokensFound: tokens.length,
-    inboxSkipped,
+    inboxSkipped: true,
+    stoppedEarly: !!pushResult.stoppedEarly || Date.now() >= deadlineAt,
     elapsedMs: Date.now() - started,
-    pushErrors: pushResult.errors,
+    pushErrors: pushResult.errors.slice(0, 5),
   };
 }
 
@@ -470,21 +472,16 @@ module.exports = async ({ req, res, log, error }) => {
     const body = { ...getQueryJson(req), ...getBodyJson(req) };
     const { creatorUserId, creatorEmail, type, postId } = body;
 
-    // Default skip inbox (push-only). Pass skipInbox=false to also write notifications.
-    const skipInbox = !(
-      body.skipInbox === false ||
-      body.skipInbox === 'false' ||
-      body.skipInbox === '0'
-    );
-
     if (!creatorUserId || !type) {
       return res.json(
         {
           error: 'creatorUserId and type required',
+          howToFix:
+            'In Postman use Method POST, URL without //, Body raw JSON with creatorUserId + type. Opening the domain in a browser is GET with empty body.',
           hintPost:
-            'POST JSON: {"creatorUserId":"...","creatorEmail":"...","type":"video_post","postId":"..."}',
-          hintBrowser:
-            'https://YOUR_FUNCTION.nyc.appwrite.run/?creatorUserId=YOUR_CEO_ID&creatorEmail=YOU%40email.com&type=video_post&postId=browser-test',
+            'POST https://6a4878b30030831b2cf1.nyc.appwrite.run  JSON: {"creatorUserId":"697241bb002e97efc1e9","creatorEmail":"randydillon97@gmail.com","type":"video_post","postId":"browser-test"}',
+          hintGet:
+            'GET https://6a4878b30030831b2cf1.nyc.appwrite.run/?creatorUserId=697241bb002e97efc1e9&creatorEmail=randydillon97%40gmail.com&type=video_post&postId=browser-test',
           method,
           receivedKeys: Object.keys(body || {}),
         },
@@ -502,7 +499,6 @@ module.exports = async ({ req, res, log, error }) => {
       creatorEmail,
       type,
       postId,
-      skipInbox,
       log,
     });
 
