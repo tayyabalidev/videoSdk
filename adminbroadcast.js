@@ -10,9 +10,10 @@
 const crypto = require('crypto');
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
-const FETCH_TIMEOUT_MS = Number(process.env.BROADCAST_FETCH_TIMEOUT_MS || 12000);
-const TOTAL_BUDGET_MS = Number(process.env.BROADCAST_TOTAL_BUDGET_MS || 20000);
+const FETCH_TIMEOUT_MS = Number(process.env.BROADCAST_FETCH_TIMEOUT_MS || 10000);
+const TOTAL_BUDGET_MS = Number(process.env.BROADCAST_TOTAL_BUDGET_MS || 45000);
 const MAX_USER_PAGES = Number(process.env.BROADCAST_MAX_USER_PAGES || 30);
+const LIST_BUDGET_MS = Number(process.env.BROADCAST_LIST_BUDGET_MS || 15000);
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -389,13 +390,14 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
 
   const started = Date.now();
   const deadlineAt = started + TOTAL_BUDGET_MS;
+  const listDeadlineAt = Math.min(deadlineAt, started + LIST_BUDGET_MS);
 
   const userCol = process.env.APPWRITE_USER_COLLECTION_ID;
   const creator = await fetchJson(`${collectionUrl(userCol)}/${encodeURIComponent(creatorUserId)}`, {
     headers: appwriteHeaders(),
   });
 
-  const users = await listAllUsers(creatorUserId, log, deadlineAt);
+  const users = await listAllUsers(creatorUserId, log, listDeadlineAt);
   log?.(`Listed ${users.length} users in ${Date.now() - started}ms`);
 
   const platform = process.env.APP_PLATFORM || 'com.bilal.asab';
