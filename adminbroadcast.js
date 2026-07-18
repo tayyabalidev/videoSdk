@@ -10,10 +10,11 @@
 const crypto = require('crypto');
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
-const FETCH_TIMEOUT_MS = Number(process.env.BROADCAST_FETCH_TIMEOUT_MS || 10000);
+const FETCH_TIMEOUT_MS = Number(process.env.BROADCAST_FETCH_TIMEOUT_MS || 8000);
 const TOTAL_BUDGET_MS = Number(process.env.BROADCAST_TOTAL_BUDGET_MS || 45000);
-const MAX_USER_PAGES = Number(process.env.BROADCAST_MAX_USER_PAGES || 30);
-const LIST_BUDGET_MS = Number(process.env.BROADCAST_LIST_BUDGET_MS || 15000);
+const MAX_USER_PAGES = Number(process.env.BROADCAST_MAX_USER_PAGES || 20);
+const LIST_BUDGET_MS = Number(process.env.BROADCAST_LIST_BUDGET_MS || 10000);
+const PUSH_BUDGET_MS = Number(process.env.BROADCAST_PUSH_BUDGET_MS || 20000);
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -163,10 +164,8 @@ function normalizeAvatar(avatar) {
 }
 
 async function fetchJson(url, options = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
+  const work = (async () => {
+    const res = await fetch(url, options);
     const text = await res.text().catch(() => '');
     const data = safeJsonParse(text);
 
@@ -187,11 +186,18 @@ async function fetchJson(url, options = {}) {
       throw err;
     }
     return data;
-  } catch (e) {
-    if (e && e.name === 'AbortError') {
-      throw new Error(`Request timed out after ${FETCH_TIMEOUT_MS}ms: ${url.slice(0, 120)}`);
-    }
-    throw e;
+  })();
+
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Request timed out after ${FETCH_TIMEOUT_MS}ms: ${String(url).slice(0, 120)}`)),
+      FETCH_TIMEOUT_MS
+    );
+  });
+
+  try {
+    return await Promise.race([work, timeout]);
   } finally {
     clearTimeout(timer);
   }
@@ -389,8 +395,7 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
   }
 
   const started = Date.now();
-  const deadlineAt = started + TOTAL_BUDGET_MS;
-  const listDeadlineAt = Math.min(deadlineAt, started + LIST_BUDGET_MS);
+  const listDeadlineAt = started + LIST_BUDGET_MS;
 
   const userCol = process.env.APPWRITE_USER_COLLECTION_ID;
   const creator = await fetchJson(`${collectionUrl(userCol)}/${encodeURIComponent(creatorUserId)}`, {
@@ -441,7 +446,9 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
     },
   }));
 
-  const pushResult = await sendExpoPushMessages(messages, log, deadlineAt);
+  // Fresh push window — do not reuse list deadline (that caused pushed:0).
+  const pushDeadlineAt = Date.now() + PUSH_BUDGET_MS;
+  const pushResult = await sendExpoPushMessages(messages, log, pushDeadlineAt);
   log?.(`Pushed ${pushResult.pushed}/${tokens.length} in ${Date.now() - started}ms`);
 
   return {
@@ -450,7 +457,7 @@ async function broadcast({ creatorUserId, creatorEmail, type, postId, log }) {
     pushed: pushResult.pushed,
     tokensFound: tokens.length,
     inboxSkipped: true,
-    stoppedEarly: !!pushResult.stoppedEarly || Date.now() >= deadlineAt,
+    stoppedEarly: !!pushResult.stoppedEarly,
     elapsedMs: Date.now() - started,
     pushErrors: pushResult.errors.slice(0, 5),
   };
